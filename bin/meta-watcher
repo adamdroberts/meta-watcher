@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" != /* ]]; then
+    SOURCE="$DIR/$TARGET"
+  else
+    SOURCE="$TARGET"
+  fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "meta-watcher: no python interpreter found on PATH" >&2
+  exit 1
+fi
+
+USER_SITE="$("${PYTHON_BIN}" - <<'PY'
+import site
+print(site.getusersitepackages())
+PY
+)"
+PYTHON_VERSION="$("${PYTHON_BIN}" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+MAC_FRAMEWORK_USER_SITE="${HOME}/Library/Python/${PYTHON_VERSION}/lib/python/site-packages"
+
+EXTRA_PATHS=("${REPO_ROOT}")
+if [[ -n "${USER_SITE}" && -d "${USER_SITE}" ]]; then
+  EXTRA_PATHS+=("${USER_SITE}")
+fi
+if [[ -d "${MAC_FRAMEWORK_USER_SITE}" ]]; then
+  EXTRA_PATHS+=("${MAC_FRAMEWORK_USER_SITE}")
+fi
+
+EXTRA_JOINED="$(IFS=:; echo "${EXTRA_PATHS[*]}")"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="${EXTRA_JOINED}:${PYTHONPATH}"
+else
+  export PYTHONPATH="${EXTRA_JOINED}"
+fi
+
+exec "${PYTHON_BIN}" -m meta_watcher.app "$@"

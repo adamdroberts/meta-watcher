@@ -1,0 +1,2 @@
+[console_scripts]
+meta-watcher = meta_watcher.app:main
