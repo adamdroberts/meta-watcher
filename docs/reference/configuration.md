@@ -111,7 +111,7 @@ Each event is grouped under its own folder in the destination bucket, keyed by t
 {prefix}{event_id}/{event_id}.json           # finalized metadata
 ```
 
-The snapshot is always sent on the `start_event` transition — operators watching the bucket see a still frame within seconds of the event firing, long before the clip finalizes. Live frames are written to `/tmp/meta-watcher-frames/` and unlinked after a successful upload regardless of `delete_after_upload`.
+The snapshot is always sent on the `start_event` transition — operators watching the bucket see a still frame within seconds of the event firing, long before the clip finalizes. Live frames are written to `output.directory/{event_id}/frames/` next to the clip + snapshot so the local filesystem mirrors the bucket layout; they follow the same `delete_after_upload` policy as every other artifact (so they stay on disk by default). If `output.directory` is unwritable, the uploader falls back to `/tmp/meta-watcher-frames/` so enqueueing never hard-fails.
 
 ## `timestamps` (`TimestampConfig`)
 
