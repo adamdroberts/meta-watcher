@@ -13,13 +13,14 @@ authors = [
   { name = "OpenAI Codex" }
 ]
 dependencies = [
-  "numpy>=2.1",
+  "numpy>=1.26,<2",
   "Pillow>=11.0",
 ]
 
 [project.optional-dependencies]
 desktop = [
-  "PySide6>=6.8",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
   "opencv-python>=4.10",
   "PyYAML>=6.0",
 ]
@@ -27,10 +28,11 @@ mac = [
   "mlx-vlm>=0.4.3",
 ]
 linux = [
+  "sam3 @ git+https://github.com/facebookresearch/sam3.git@main",
+  "einops",
+  "pycocotools",
   "torch>=2.7",
   "torchvision>=0.22",
-  "transformers>=4.50",
-  "accelerate>=1.5",
 ]
 dev = [
   "pytest>=8.3",
@@ -41,3 +43,6 @@ meta-watcher = "meta_watcher.app:main"
 
 [tool.setuptools.packages.find]
 include = ["meta_watcher*"]
+
+[tool.setuptools.package-data]
+"meta_watcher.web" = ["static/**/*"]

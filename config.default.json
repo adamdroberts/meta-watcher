@@ -1,12 +1,16 @@
 {
   "source": {
     "kind": "webcam",
-    "value": "0"
+    "value": "0",
+    "width": 1280,
+    "height": 720,
+    "fps": 30
   },
   "models": {
     "mac_sam_model_id": "mlx-community/sam3.1-bf16",
     "linux_sam_model_id": "facebook/sam3.1",
-    "label_model_id": "Qwen/Qwen2.5-VL-3B-Instruct"
+    "inference_max_side": 960,
+    "inference_interval_ms": 200
   },
   "thresholds": {
     "person_confidence": 0.3,
@@ -16,15 +20,13 @@
     "min_area_ratio": 0.002
   },
   "timings": {
-    "inventory_sample_seconds": 1.0,
     "empty_scene_rescan_seconds": 5.0,
     "person_confirmation_frames": 3,
-    "pre_roll_seconds": 3.0,
+    "pre_roll_seconds": 0.5,
     "post_roll_seconds": 2.0
   },
   "inventory": {
-    "required_samples": 3,
-    "max_labels": 12,
+    "labels": ["chair", "table", "laptop", "book", "cup", "bottle", "plant"],
     "auto_rescan": true
   },
   "output": {

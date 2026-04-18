@@ -1,11 +1,114 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import glob
+from pathlib import Path
 import sys
 import time
 
 from .config import SourceConfig
 from .core import VideoFrame
+
+
+DEFAULT_WEBCAM_WIDTH = 1280
+DEFAULT_WEBCAM_HEIGHT = 720
+DEFAULT_WEBCAM_FPS = 30
+
+
+@dataclass(slots=True)
+class WebcamDevice:
+    index: int
+    label: str
+    path: str | None = None
+
+
+def list_webcams() -> list[WebcamDevice]:
+    if sys.platform.startswith("linux"):
+        return _list_linux_webcams()
+    if sys.platform == "darwin":
+        return _list_macos_webcams()
+    return _list_probe_fallback(range(4))
+
+
+def _list_linux_webcams() -> list[WebcamDevice]:
+    seen: dict[str, WebcamDevice] = {}
+    for path in sorted(glob.glob("/dev/video*")):
+        try:
+            index = int(path.removeprefix("/dev/video"))
+        except ValueError:
+            continue
+        name_path = Path(f"/sys/class/video4linux/video{index}/name")
+        name = name_path.read_text(encoding="utf-8").strip() if name_path.exists() else f"Camera {index}"
+        if not _linux_node_supports_capture(index):
+            continue
+        key = name or path
+        existing = seen.get(key)
+        if existing is None or existing.index > index:
+            seen[key] = WebcamDevice(index=index, label=f"{name} (video{index})", path=path)
+    return sorted(seen.values(), key=lambda d: d.index)
+
+
+def _linux_node_supports_capture(index: int) -> bool:
+    # Many USB cameras (e.g. Elgato Facecam Pro) expose a second /dev/videoN node
+    # that carries metadata only. Filter those out when we can read capabilities.
+    caps_path = Path(f"/sys/class/video4linux/video{index}/device/capabilities")
+    if not caps_path.exists():
+        # Kernel doesn't expose capability bits here — assume it's a capture node.
+        return True
+    try:
+        raw = caps_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    try:
+        bits = int(raw, 16) if raw.startswith("0x") else int(raw)
+    except ValueError:
+        return True
+    V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+    V4L2_CAP_VIDEO_CAPTURE_MPLANE = 0x00001000
+    return bool(bits & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE))
+
+
+def _list_macos_webcams() -> list[WebcamDevice]:
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            ["system_profiler", "SPCameraDataType", "-json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        import json
+
+        payload = json.loads(proc.stdout)
+        entries = payload.get("SPCameraDataType", []) if isinstance(payload, dict) else []
+        devices: list[WebcamDevice] = []
+        for index, entry in enumerate(entries):
+            name = entry.get("_name") if isinstance(entry, dict) else None
+            label = name or f"Camera {index}"
+            devices.append(WebcamDevice(index=index, label=f"{label} (index {index})"))
+        if devices:
+            return devices
+    except Exception:
+        pass
+    return _list_probe_fallback(range(4))
+
+
+def _list_probe_fallback(indices) -> list[WebcamDevice]:
+    try:
+        import cv2
+    except ImportError:
+        return []
+    devices: list[WebcamDevice] = []
+    for index in indices:
+        capture = cv2.VideoCapture(index)
+        opened = capture.isOpened()
+        capture.release()
+        if opened:
+            devices.append(WebcamDevice(index=index, label=f"Camera {index}"))
+    return devices
 
 
 class VideoSource(ABC):
@@ -42,6 +145,10 @@ class OpenCvVideoSource(VideoSource):
             import cv2
         except ImportError as exc:
             raise RuntimeError("opencv-python is required for webcam, RTSP, and file sources.") from exc
+        try:
+            cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         self._cv2 = cv2
         return cv2
 
@@ -87,8 +194,18 @@ class OpenCvVideoSource(VideoSource):
 
 
 class WebcamSource(OpenCvVideoSource):
-    def __init__(self, value: str) -> None:
+    def __init__(
+        self,
+        value: str,
+        *,
+        width: int = DEFAULT_WEBCAM_WIDTH,
+        height: int = DEFAULT_WEBCAM_HEIGHT,
+        fps: int = DEFAULT_WEBCAM_FPS,
+    ) -> None:
         super().__init__(source_id="webcam", capture_value=value, live=True)
+        self._requested_width = int(width)
+        self._requested_height = int(height)
+        self._requested_fps = int(fps)
 
     def open(self) -> None:
         cv2 = self._load_cv2()
@@ -103,18 +220,35 @@ class WebcamSource(OpenCvVideoSource):
                 failures.append(index)
                 continue
 
-            # Prime the device once so we reject camera slots that "open" but never produce frames.
-            ok, frame = capture.read()
+            # V4L2 and AVFoundation often need a few cycles before the first frame
+            # is available. Retry before giving up on the device.
+            ok, frame = False, None
+            for _ in range(8):
+                ok, frame = capture.read()
+                if ok and frame is not None:
+                    break
+                time.sleep(0.05)
             if not ok or frame is None:
                 capture.release()
                 failures.append(index)
                 continue
 
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            capture.set(cv2.CAP_PROP_FPS, 30)
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._requested_width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._requested_height)
+            capture.set(cv2.CAP_PROP_FPS, self._requested_fps)
             self.capture_value = index
             self._finalize_capture(capture)
+
+            actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            actual_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            print(
+                f"[meta-watcher] webcam index={index} "
+                f"requested={self._requested_width}x{self._requested_height}@{self._requested_fps} "
+                f"actual={actual_width}x{actual_height}@{actual_fps:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
             return
 
         message = f"Failed to open any webcam device from candidates {candidates}."
@@ -137,13 +271,15 @@ class WebcamSource(OpenCvVideoSource):
             return None
 
     def _candidate_indices(self, configured: int | None) -> list[int]:
-        candidates: list[int] = []
+        # When the user has picked an explicit index (typical when chosen from the
+        # enumerated dropdown) trust it and avoid probing non-existent devices.
         if configured is not None:
-            candidates.append(configured)
-        for index in range(8):
-            if index not in candidates:
-                candidates.append(index)
-        return candidates
+            return [configured]
+        if sys.platform.startswith("linux"):
+            linux_indices = [device.index for device in _list_linux_webcams()]
+            if linux_indices:
+                return linux_indices
+        return list(range(4))
 
 
 class RtspSource(OpenCvVideoSource):
@@ -159,7 +295,12 @@ class FileSource(OpenCvVideoSource):
 def build_source(config: SourceConfig) -> VideoSource:
     kind = config.kind.lower()
     if kind == "webcam":
-        return WebcamSource(config.value)
+        return WebcamSource(
+            config.value,
+            width=config.width,
+            height=config.height,
+            fps=config.fps,
+        )
     if kind == "rtsp":
         return RtspSource(config.value)
     if kind == "file":

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 from typing import Any
@@ -10,13 +10,17 @@ from typing import Any
 class SourceConfig:
     kind: str = "webcam"
     value: str = "0"
+    width: int = 1280
+    height: int = 720
+    fps: int = 30
 
 
 @dataclass(slots=True)
 class ModelConfig:
     mac_sam_model_id: str = "mlx-community/sam3.1-bf16"
     linux_sam_model_id: str = "facebook/sam3.1"
-    label_model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    inference_max_side: int = 960
+    inference_interval_ms: int = 250
 
 
 @dataclass(slots=True)
@@ -30,7 +34,6 @@ class ThresholdConfig:
 
 @dataclass(slots=True)
 class TimingConfig:
-    inventory_sample_seconds: float = 1.0
     empty_scene_rescan_seconds: float = 5.0
     person_confirmation_frames: int = 3
     pre_roll_seconds: float = 3.0
@@ -39,8 +42,7 @@ class TimingConfig:
 
 @dataclass(slots=True)
 class InventoryConfig:
-    required_samples: int = 3
-    max_labels: int = 12
+    labels: list[str] = field(default_factory=list)
     auto_rescan: bool = True
 
 

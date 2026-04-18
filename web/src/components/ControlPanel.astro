@@ -1,0 +1,97 @@
+---
+---
+<aside class="control-panel" aria-label="Operator controls">
+  <h1>Meta Watcher</h1>
+
+  <div id="error-banner" class="banner" role="alert"></div>
+
+  <div class="status">
+    <span class="label">Mode</span>
+    <span class="value"><span id="status-mode" class="mode-pill" data-mode="idle">idle</span></span>
+  </div>
+  <div class="status">
+    <span class="label">Status</span>
+    <span id="status-text" class="value">idle</span>
+  </div>
+  <div class="status">
+    <span class="label">Recording</span>
+    <span id="status-recording" class="value">idle</span>
+  </div>
+
+  <form id="controls" class="controls">
+    <label>
+      <span>Source kind</span>
+      <select name="source_kind">
+        <option value="webcam">webcam</option>
+        <option value="rtsp">rtsp</option>
+        <option value="file">file</option>
+      </select>
+    </label>
+    <label>
+      <span>Source value</span>
+      <span style="display:flex; gap:6px; align-items:center;">
+        <select name="webcam_device" style="flex:1; display:none;"></select>
+        <input type="text" name="source_value" autocomplete="off" style="flex:1;" />
+        <button
+          id="btn-refresh-cams"
+          type="button"
+          title="Re-scan webcams"
+          style="padding:4px 8px;"
+        >↻</button>
+      </span>
+    </label>
+
+    <label class="full">
+      <span>Output directory</span>
+      <input type="text" name="output_dir" autocomplete="off" />
+    </label>
+
+    <label>
+      <span>Person threshold</span>
+      <input type="number" name="person_threshold" min="0" max="1" step="0.05" />
+    </label>
+    <label>
+      <span>Inventory threshold</span>
+      <input type="number" name="inventory_threshold" min="0" max="1" step="0.05" />
+    </label>
+
+    <label class="full">
+      <span>Inventory labels (comma-separated)</span>
+      <input
+        type="text"
+        name="inventory_labels"
+        autocomplete="off"
+        placeholder="e.g. chair, laptop, book, bottle"
+      />
+    </label>
+    <label>
+      <span>&nbsp;</span>
+      <span style="display:flex; gap:12px; align-items:center; padding-top:4px;">
+        <label style="flex-direction:row; align-items:center; gap:6px; color:var(--text);">
+          <input type="checkbox" name="auto_rescan" />
+          <span>Auto rescan</span>
+        </label>
+        <label style="flex-direction:row; align-items:center; gap:6px; color:var(--text);">
+          <input type="checkbox" name="recording_enabled" checked />
+          <span>Record clips</span>
+        </label>
+      </span>
+    </label>
+
+    <div class="buttons">
+      <button id="btn-start" type="submit" class="primary">Start</button>
+      <button id="btn-stop" type="button" class="danger" disabled>Stop</button>
+      <button id="btn-rescan" type="button" disabled>Manual rescan</button>
+    </div>
+  </form>
+
+  <div>
+    <div class="status"><span class="label">Frozen scene inventory</span></div>
+    <ul id="inventory-list" class="inventory" aria-live="polite"></ul>
+  </div>
+
+  <div>
+    <div class="status"><span class="label">Completed clips</span></div>
+    <div id="completed-clips" class="clips" aria-live="polite"></div>
+  </div>
+</aside>

@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import importlib.util
-import json
+from collections.abc import Iterable, Mapping
 import multiprocessing as mp
 import platform
-import re
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -36,9 +31,41 @@ class InferenceProvider(ABC):
     def shutdown(self) -> None: ...
 
 
-class SceneLabelProposer(ABC):
-    @abstractmethod
-    def propose(self, frame: np.ndarray) -> dict[str, float]: ...
+def _model_execution_context(model: Any) -> tuple[Any | None, Any | None]:
+    device = getattr(model, "device", None)
+    dtype = getattr(model, "dtype", None)
+
+    if device is not None and dtype is not None:
+        return device, dtype
+
+    try:
+        parameters: Iterable[Any] = model.parameters()
+        first_parameter = next(iter(parameters))
+    except (AttributeError, StopIteration, TypeError):
+        return device, dtype
+
+    if device is None:
+        device = getattr(first_parameter, "device", None)
+    if dtype is None:
+        dtype = getattr(first_parameter, "dtype", None)
+    return device, dtype
+
+
+def _move_inputs_to_model(inputs: Mapping[str, Any], model: Any) -> dict[str, Any]:
+    device, dtype = _model_execution_context(model)
+    moved: dict[str, Any] = {}
+    for key, value in inputs.items():
+        if not hasattr(value, "to"):
+            moved[key] = value
+            continue
+
+        kwargs: dict[str, Any] = {}
+        if device is not None:
+            kwargs["device"] = device
+        if dtype is not None and hasattr(value, "is_floating_point") and value.is_floating_point():
+            kwargs["dtype"] = dtype
+        moved[key] = value.to(**kwargs) if kwargs else value
+    return moved
 
 
 class MlxSam31Provider(InferenceProvider):
@@ -94,10 +121,49 @@ class MlxSam31Provider(InferenceProvider):
         self._model = None
 
 
+_SAM3_FUSED_PATCHED = False
+
+
+def _patch_sam3_fused_addmm_to_fp32() -> None:
+    """Replace sam3.perflib.fused.addmm_act with an fp32-safe linear+activation.
+
+    Upstream's fused op casts mat1/mat2/bias to bfloat16 and uses the
+    `torch.ops.aten._addmm_activation` kernel, which leaves the output in
+    bf16. When we run the rest of the graph in fp32, subsequent Linear
+    layers see bf16 activations against fp32 weights and torch raises
+    `mat1 and mat2 must have the same dtype`. Swapping the fused op for a
+    plain torch.nn.functional.linear + activation keeps everything in fp32
+    at a small perf cost. Both the original module and the vitdet call
+    site (which bound the symbol at import time) are patched.
+    """
+    global _SAM3_FUSED_PATCHED
+    if _SAM3_FUSED_PATCHED:
+        return
+    try:
+        import torch
+        from sam3.perflib import fused as _fused
+        from sam3.model import vitdet as _vitdet
+    except ImportError:
+        return
+
+    def _addmm_act_fp32(activation, linear, mat1):
+        y = torch.nn.functional.linear(mat1, linear.weight, linear.bias)
+        if activation in (torch.nn.functional.gelu, torch.nn.GELU):
+            return torch.nn.functional.gelu(y)
+        if activation in (torch.nn.functional.relu, torch.nn.ReLU):
+            return torch.nn.functional.relu(y)
+        raise ValueError(f"Unexpected activation {activation}")
+
+    _fused.addmm_act = _addmm_act_fp32
+    _vitdet.addmm_act = _addmm_act_fp32
+    _SAM3_FUSED_PATCHED = True
+
+
 class CudaSam31Provider(InferenceProvider):
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self._processor: Any | None = None
+        self._device: Any | None = None
         self._tracking_prompts: list[str] = list(PEOPLE_PROMPTS)
 
     def warmup(self) -> None:
@@ -107,22 +173,60 @@ class CudaSam31Provider(InferenceProvider):
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
         except ImportError as exc:
-            raise RuntimeError("The official facebookresearch/sam3 package is required for Linux CUDA inference.") from exc
+            raise RuntimeError(
+                "Linux CUDA inference requires the official facebookresearch/sam3 package. "
+                'Reinstall with `python3 -m pip install -e ".[desktop,linux]"` to pull the upstream main branch.'
+            ) from exc
+
+        import torch
+
+        # sam3's perflib ships a fused addmm+activation kernel (vitdet.Mlp.fc1
+        # path) that hard-casts its inputs and the Linear weight/bias to
+        # bfloat16 on every call. Its output then feeds a plain fp32 Linear
+        # (fc2) and triggers `mat1 and mat2 must have the same dtype: float
+        # vs bfloat16`. Replace the fused op with a simple fp32 linear+act so
+        # the whole graph stays fp32. Must patch both the defining module and
+        # the call site (vitdet already did `from ... import addmm_act`).
+        _patch_sam3_fused_addmm_to_fp32()
 
         try:
             model = build_sam3_image_model(model_id=self.model_id)
         except TypeError:
             model = build_sam3_image_model()
+
+        # Upstream sam3 can leave the vision backbone in bf16 while the text
+        # path stays fp32. Force a single floating dtype on the whole graph
+        # and switch to inference mode before handing the model to the
+        # processor. Use _apply so complex-valued tensors (e.g. rotary
+        # embeddings) keep their dtype instead of being silently truncated
+        # to real.
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        target_device = self._device
+        target_dtype = torch.float32
+
+        def _cast(tensor: "torch.Tensor") -> "torch.Tensor":
+            moved = tensor.to(device=target_device)
+            if moved.is_floating_point():
+                return moved.to(dtype=target_dtype)
+            return moved
+
+        model = model._apply(_cast)
+        model.train(False)
         self._processor = Sam3Processor(model)
 
     def detect_text_prompts(self, frame: VideoFrame, prompts: list[str] | tuple[str, ...]) -> list[Detection]:
         self.warmup()
         assert self._processor is not None
-        state = self._processor.set_image(Image.fromarray(frame.image))
+        import torch
+
+        device_type = self._device.type if self._device is not None else "cpu"
+        # print(f"Inference device: {device_type}")
         detections: list[Detection] = []
-        for prompt in prompts:
-            output = self._processor.set_text_prompt(state=state, prompt=prompt)
-            detections.extend(_detections_from_output_dict(frame, output, prompt))
+        with torch.inference_mode(), torch.autocast(device_type=device_type, enabled=True):
+            state = self._processor.set_image(Image.fromarray(frame.image))
+            for prompt in prompts:
+                output = self._processor.set_text_prompt(state=state, prompt=prompt)
+                detections.extend(_detections_from_output_dict(frame, output, prompt))
         return detections
 
     def start_tracking(self, frame: VideoFrame, prompts: list[str] | tuple[str, ...]) -> list[Detection]:
@@ -134,86 +238,7 @@ class CudaSam31Provider(InferenceProvider):
 
     def shutdown(self) -> None:
         self._processor = None
-
-
-class QwenSceneLabelProposer(SceneLabelProposer):
-    def __init__(self, model_id: str) -> None:
-        self.model_id = model_id
-        self._transformers_bundle: tuple[Any, Any] | None = None
-
-    def propose(self, frame: np.ndarray) -> dict[str, float]:
-        if importlib.util.find_spec("transformers"):
-            return self._propose_with_transformers(frame)
-        if sys.platform == "darwin" and importlib.util.find_spec("mlx_vlm"):
-            return self._propose_with_mlx_cli(frame)
-        raise RuntimeError("No scene label proposer backend is installed. Install mlx-vlm or transformers.")
-
-    def _prompt(self) -> str:
-        return (
-            "List the distinct non-human physical objects visible in this scene. "
-            "Exclude people, body parts, reflections, screens with content, and actions. "
-            "Return strict JSON as an array of short lowercase noun phrases, max 12 items."
-        )
-
-    def _propose_with_mlx_cli(self, frame: np.ndarray) -> dict[str, float]:
-        image = Image.fromarray(frame)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-            image.save(handle.name)
-            temp_path = Path(handle.name)
-        try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "mlx_vlm.generate",
-                    "--model",
-                    self.model_id,
-                    "--max-tokens",
-                    "120",
-                    "--temp",
-                    "0.0",
-                    "--prompt",
-                    self._prompt(),
-                    "--image",
-                    str(temp_path),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        finally:
-            temp_path.unlink(missing_ok=True)
-        return _parse_label_payload(proc.stdout)
-
-    def _propose_with_transformers(self, frame: np.ndarray) -> dict[str, float]:
-        if self._transformers_bundle is None:
-            try:
-                from transformers import AutoModelForImageTextToText, AutoProcessor
-            except ImportError as exc:
-                raise RuntimeError("transformers is required for Qwen scene label proposing.") from exc
-
-            processor = AutoProcessor.from_pretrained(self.model_id)
-            model = AutoModelForImageTextToText.from_pretrained(self.model_id, device_map="auto")
-            self._transformers_bundle = (processor, model)
-
-        processor, model = self._transformers_bundle
-        image = Image.fromarray(frame)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": self._prompt()},
-                ],
-            }
-        ]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt")
-        inputs = {key: value.to(model.device) for key, value in inputs.items()}
-        generated = model.generate(**inputs, max_new_tokens=128)
-        trimmed = generated[:, inputs["input_ids"].shape[1] :]
-        output = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        return _parse_label_payload(output)
+        self._device = None
 
 
 def build_provider(models: ModelConfig) -> InferenceProvider:
@@ -221,10 +246,6 @@ def build_provider(models: ModelConfig) -> InferenceProvider:
     if sys.platform == "darwin" and machine in {"arm64", "aarch64"}:
         return MlxSubprocessSam31Provider(models.mac_sam_model_id)
     return CudaSam31Provider(models.linux_sam_model_id)
-
-
-def build_label_proposer(models: ModelConfig) -> SceneLabelProposer:
-    return QwenSceneLabelProposer(models.label_model_id)
 
 
 class MlxSubprocessSam31Provider(InferenceProvider):
@@ -415,35 +436,49 @@ def _monotonic_seconds() -> float:
     return time.monotonic()
 
 
+def _to_numpy(value: Any, dtype: Any = None) -> np.ndarray:
+    """Convert tensor-like values to numpy, handling CUDA tensors."""
+    if value is None:
+        return np.asarray([])
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        array = value.detach().cpu().numpy()
+        if dtype is not None:
+            array = array.astype(dtype)
+        return array
+    if dtype is not None:
+        return np.asarray(value, dtype=dtype)
+    return np.asarray(value)
+
+
 def _detections_from_output_dict(frame: VideoFrame, output: Any, prompt: str) -> list[Detection]:
     if not isinstance(output, dict):
         return []
-    boxes = np.asarray(output.get("boxes", []))
-    scores = np.asarray(output.get("scores", []), dtype=float)
-    masks = output.get("masks", [])
+    boxes = _to_numpy(output.get("boxes", []))
+    scores = _to_numpy(output.get("scores", []), dtype=float)
+    raw_masks = output.get("masks", [])
     labels = output.get("labels", [prompt] * len(scores))
     detections: list[Detection] = []
     for index, score in enumerate(scores.tolist()):
         if boxes.size == 0:
             continue
         box = _box_tuple(boxes[index], frame)
-        mask = masks[index] if index < len(masks) else None
+        mask = raw_masks[index] if index < len(raw_masks) else None
         label = labels[index] if index < len(labels) else prompt
         detections.append(Detection(label=str(label), confidence=float(score), bbox=box, mask=_coerce_mask(mask)))
     return detections
 
 
 def _detections_from_generic_result(frame: VideoFrame, result: Any, prompt_override: str | None = None) -> list[Detection]:
-    boxes = np.asarray(getattr(result, "boxes", []))
-    scores = np.asarray(getattr(result, "scores", []), dtype=float)
-    masks = getattr(result, "masks", [])
+    boxes = _to_numpy(getattr(result, "boxes", []))
+    scores = _to_numpy(getattr(result, "scores", []), dtype=float)
+    raw_masks = getattr(result, "masks", [])
     labels = getattr(result, "labels", None)
     detections: list[Detection] = []
     for index, score in enumerate(scores.tolist()):
         if boxes.size == 0:
             continue
         label = prompt_override or (labels[index] if labels is not None and index < len(labels) else "object")
-        mask = masks[index] if index < len(masks) else None
+        mask = raw_masks[index] if index < len(raw_masks) else None
         detections.append(
             Detection(
                 label=str(label),
@@ -465,39 +500,14 @@ def _coerce_mask(mask: Any) -> np.ndarray | None:
         return None
     if isinstance(mask, np.ndarray):
         return mask
+    if hasattr(mask, "detach") and hasattr(mask, "cpu") and hasattr(mask, "numpy"):
+        try:
+            return mask.detach().cpu().numpy()
+        except Exception:
+            return None
     try:
         return np.asarray(mask)
     except Exception:
         return None
 
 
-def _parse_label_payload(payload: str) -> dict[str, float]:
-    payload = payload.strip()
-    for candidate in _json_candidates(payload):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, list):
-                return {str(item).strip().lower(): 0.6 for item in parsed if str(item).strip()}
-            if isinstance(parsed, dict):
-                labels = parsed.get("labels") or parsed.get("objects") or parsed.get("items")
-                if isinstance(labels, list):
-                    return {str(item).strip().lower(): 0.6 for item in labels if str(item).strip()}
-        except json.JSONDecodeError:
-            continue
-
-    fallback = {}
-    for token in re.split(r"[\n,]", payload):
-        label = token.strip(" -•\t").lower()
-        if label:
-            fallback[label] = 0.5
-    return fallback
-
-
-def _json_candidates(payload: str) -> list[str]:
-    candidates: list[str] = []
-    for start_char, end_char in (("[", "]"), ("{", "}")):
-        start = payload.find(start_char)
-        end = payload.rfind(end_char)
-        if start != -1 and end != -1 and end > start:
-            candidates.append(payload[start : end + 1])
-    return candidates
