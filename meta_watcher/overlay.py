@@ -17,6 +17,8 @@ def render_overlay(
     inventory_active: bool,
     recording_active: bool,
     status_text: str,
+    hud_timings: dict[str, float] | None = None,
+    hud_fps: float = 0.0,
 ) -> np.ndarray:
     canvas = Image.fromarray(frame).convert("RGBA")
     draw = ImageDraw.Draw(canvas, "RGBA")
@@ -34,17 +36,28 @@ def render_overlay(
         draw.rectangle(text_box, fill=color + (200,))
         draw.text((text_box[0] + 4, text_box[1] + 2), caption, fill=(255, 255, 255, 255))
 
-    draw.rectangle((10, 10, 310, 88), fill=(0, 0, 0, 165))
+    status_height = 88 if not hud_timings else 128
+    draw.rectangle((10, 10, 310, status_height), fill=(0, 0, 0, 165))
     draw.text((20, 18), f"Mode: {mode}", fill=(255, 255, 255, 255))
     draw.text((20, 38), f"Inventory scan: {'on' if inventory_active else 'frozen'}", fill=(255, 255, 255, 255))
     draw.text((20, 58), f"Recording: {'active' if recording_active else 'idle'}", fill=(255, 255, 255, 255))
     draw.text((20, 78), status_text[:42], fill=(255, 255, 255, 255))
+    if hud_timings:
+        infer = hud_timings.get("inference", 0.0)
+        ovl = hud_timings.get("overlay", 0.0)
+        rec = hud_timings.get("recorder", 0.0)
+        draw.text(
+            (20, 98),
+            f"{hud_fps:>4.1f} fps  i:{infer:>4.0f} o:{ovl:>3.0f} r:{rec:>3.0f} ms",
+            fill=(200, 235, 255, 255),
+        )
 
-    draw.rectangle((10, 100, 320, 132 + (18 * max(1, len(inventory)))), fill=(0, 0, 0, 145))
-    draw.text((20, 108), "Frozen scene inventory", fill=(255, 255, 255, 255))
+    inv_top = status_height + 12
+    draw.rectangle((10, inv_top, 320, inv_top + 32 + (18 * max(1, len(inventory)))), fill=(0, 0, 0, 145))
+    draw.text((20, inv_top + 8), "Frozen scene inventory", fill=(255, 255, 255, 255))
     for index, item in enumerate(inventory[:12], start=1):
         draw.text(
-            (20, 108 + (18 * index)),
+            (20, inv_top + 8 + (18 * index)),
             f"{index:02d}. {item.label} ({item.confidence:.2f})",
             fill=(255, 255, 255, 255),
         )

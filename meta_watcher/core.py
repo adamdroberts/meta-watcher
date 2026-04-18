@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import threading
 from typing import Any, Protocol
 
 import numpy as np
@@ -110,62 +111,8 @@ class PipelineSnapshot:
     recording_active: bool
     completed_clips: list[Path]
     status_text: str
-
-
-class LabelStabilizer:
-    def __init__(self, required_samples: int = 3, max_labels: int = 12) -> None:
-        self.required_samples = required_samples
-        self.max_labels = max_labels
-        self._state: dict[str, dict[str, float]] = {}
-        self._stable: dict[str, InventoryItem] = {}
-
-    def reset(self) -> None:
-        self._state.clear()
-        self._stable.clear()
-
-    def observe(self, proposals: dict[str, float], timestamp: float) -> list[InventoryItem]:
-        normalized: dict[str, float] = {}
-        for raw_label, score in proposals.items():
-            label = normalize_label(raw_label)
-            if not label or is_people_label(label):
-                continue
-            normalized[label] = max(score, normalized.get(label, 0.0))
-
-        present = set(normalized)
-        for label, score in normalized.items():
-            state = self._state.setdefault(label, {"streak": 0.0, "samples": 0.0, "confidence_sum": 0.0, "last_seen": timestamp})
-            state["streak"] += 1.0
-            state["samples"] += 1.0
-            state["confidence_sum"] += score
-            state["last_seen"] = timestamp
-            if state["streak"] >= self.required_samples:
-                avg_conf = state["confidence_sum"] / max(1.0, state["samples"])
-                self._stable[label] = InventoryItem(
-                    label=label,
-                    confidence=avg_conf,
-                    samples=int(state["samples"]),
-                    last_seen=timestamp,
-                )
-
-        for label, state in self._state.items():
-            if label not in present:
-                state["streak"] = 0.0
-
-        ranked = sorted(
-            self._stable.values(),
-            key=lambda item: (item.confidence, item.samples, item.last_seen),
-            reverse=True,
-        )[: self.max_labels]
-        self._stable = {item.label: item for item in ranked}
-        return ranked
-
-    @property
-    def items(self) -> list[InventoryItem]:
-        return sorted(self._stable.values(), key=lambda item: item.label)
-
-    @property
-    def labels(self) -> list[str]:
-        return [item.label for item in self.items]
+    timings: dict[str, float] = field(default_factory=dict)
+    effective_fps: float = 0.0
 
 
 @dataclass(slots=True)
@@ -434,69 +381,109 @@ class ClipRecorder:
         self._buffer: deque[_BufferedFrame] = deque()
         self._event: _OpenEvent | None = None
         self._completed: list[EventArtifact] = []
+        # Producer thread calls push_frame; consumer thread calls start/finish/drain.
+        # Use an RLock so start_event can delegate to helper methods without deadlocking.
+        self._lock = threading.RLock()
 
     def _default_sink_factory(self, path: Path, size: tuple[int, int], fps: float) -> ClipSink:
         return OpenCvClipSink(path, size, fps)
 
     @property
     def recording_active(self) -> bool:
-        return self._event is not None
+        with self._lock:
+            return self._event is not None
 
-    def push_frame(self, frame: VideoFrame, overlay: np.ndarray) -> list[EventArtifact]:
-        self._buffer.append(_BufferedFrame(timestamp=frame.timestamp, image=np.array(overlay, copy=True)))
-        self._prune_buffer(frame.timestamp)
+    def push_frame(
+        self,
+        frame: VideoFrame,
+        image: np.ndarray | None = None,
+    ) -> list[EventArtifact]:
+        """Buffer the frame and, if an event is open, write it to the sink.
 
-        if self._event is not None:
-            self._event.sink.write(overlay)
-            if self._event.end_requested_at is not None and frame.timestamp >= self._event.end_requested_at:
-                self._close_event(frame.timestamp)
+        Safe to call from any thread. Returns the artifact list for anything
+        closed by *this* call. Items are still accumulated on the internal
+        completed list so consumers can pick them up via `drain_completed`.
+        The optional `image` override exists for tests and legacy callers;
+        default is to write the raw camera pixels (`frame.image`).
+        """
+        payload = image if image is not None else frame.image
+        newly_closed: list[EventArtifact] = []
+        with self._lock:
+            self._buffer.append(
+                _BufferedFrame(timestamp=frame.timestamp, image=np.array(payload, copy=True))
+            )
+            self._prune_buffer(frame.timestamp)
 
-        return self.drain_completed()
+            if self._event is not None:
+                self._event.sink.write(payload)
+                if (
+                    self._event.end_requested_at is not None
+                    and frame.timestamp >= self._event.end_requested_at
+                ):
+                    artifact = self._close_event(frame.timestamp)
+                    if artifact is not None:
+                        newly_closed.append(artifact)
+        return newly_closed
 
     def _prune_buffer(self, now: float) -> None:
         while self._buffer and (now - self._buffer[0].timestamp) > self.pre_roll_seconds:
             self._buffer.popleft()
 
-    def start_event(self, frame: VideoFrame, inventory: list[str]) -> None:
-        if self._event is not None:
-            return
+    def _estimate_buffer_fps(self, *, fallback: float) -> float:
+        if len(self._buffer) >= 2:
+            span = self._buffer[-1].timestamp - self._buffer[0].timestamp
+            if span > 0:
+                return (len(self._buffer) - 1) / span
+        return max(1.0, fallback)
 
-        started_at = frame.timestamp
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        clip_path = self.output_dir / f"{frame.source_id}_{stamp}.mp4"
-        metadata_path = clip_path.with_suffix(".json")
-        fps = frame.fps or 12.0
-        sink = self.sink_factory(clip_path, (frame.width, frame.height), fps)
-        self._event = _OpenEvent(
-            clip_path=clip_path,
-            metadata_path=metadata_path,
-            started_at=started_at,
-            inventory=list(inventory),
-            source_id=frame.source_id,
-            sink=sink,
-        )
-        for buffered in self._buffer:
-            sink.write(buffered.image)
+    def start_event(self, frame: VideoFrame, inventory: list[str]) -> None:
+        with self._lock:
+            if self._event is not None:
+                return
+
+            started_at = frame.timestamp
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            clip_path = self.output_dir / f"{frame.source_id}_{stamp}.mp4"
+            metadata_path = clip_path.with_suffix(".json")
+            fps = self._estimate_buffer_fps(fallback=frame.fps or 12.0)
+            sink = self.sink_factory(clip_path, (frame.width, frame.height), fps)
+            self._event = _OpenEvent(
+                clip_path=clip_path,
+                metadata_path=metadata_path,
+                started_at=started_at,
+                inventory=list(inventory),
+                source_id=frame.source_id,
+                sink=sink,
+            )
+            for buffered in self._buffer:
+                sink.write(buffered.image)
 
     def finish_event(self, timestamp: float, person_ids: list[str]) -> None:
-        if self._event is None:
-            return
-        self._event.person_ids.update(person_ids)
-        if self._event.end_requested_at is None:
-            self._event.end_requested_at = timestamp + self.post_roll_seconds
+        with self._lock:
+            if self._event is None:
+                return
+            self._event.person_ids.update(person_ids)
+            if self._event.end_requested_at is None:
+                self._event.end_requested_at = timestamp + self.post_roll_seconds
 
     def add_person_ids(self, person_ids: list[str]) -> None:
-        if self._event is None:
-            return
-        self._event.person_ids.update(person_ids)
+        with self._lock:
+            if self._event is None:
+                return
+            self._event.person_ids.update(person_ids)
 
     def drain_completed(self) -> list[EventArtifact]:
+        with self._lock:
+            return self._drain_completed_locked()
+
+    def _drain_completed_locked(self) -> list[EventArtifact]:
         completed = list(self._completed)
         self._completed.clear()
         return completed
 
-    def _close_event(self, ended_at: float) -> None:
-        assert self._event is not None
+    def _close_event(self, ended_at: float) -> EventArtifact | None:
+        if self._event is None:
+            return None
         event = self._event
         event.sink.close()
         payload = {
@@ -509,13 +496,13 @@ class ClipRecorder:
         }
         with event.metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-        self._completed.append(
-            EventArtifact(
-                clip_path=event.clip_path,
-                metadata_path=event.metadata_path,
-                started_at=event.started_at,
-                ended_at=ended_at,
-                person_ids=sorted(event.person_ids),
-            )
+        artifact = EventArtifact(
+            clip_path=event.clip_path,
+            metadata_path=event.metadata_path,
+            started_at=event.started_at,
+            ended_at=ended_at,
+            person_ids=sorted(event.person_ids),
         )
+        self._completed.append(artifact)
         self._event = None
+        return artifact

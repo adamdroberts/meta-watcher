@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -12,18 +14,77 @@ from .core import (
     ClipRecorder,
     Detection,
     InventoryItem,
-    LabelStabilizer,
     PipelineSnapshot,
     StreamStateMachine,
     TrackManager,
     VideoFrame,
+    clamp_bbox,
     is_people_label,
     merge_overlapping_detections,
     normalize_label,
 )
-from .inference import InferenceProvider, SceneLabelProposer
+from .inference import InferenceProvider
 from .overlay import render_overlay
 from .sources import VideoSource
+
+
+_TIMING_WINDOW = 30
+_TIMING_STAGES = ("inference", "overlay", "recorder", "total")
+
+
+def _downscale_for_inference(frame: VideoFrame, max_side: int) -> tuple[VideoFrame, float]:
+    """Return (possibly downscaled frame, scale factor to map bboxes back to original)."""
+    height, width = frame.image.shape[:2]
+    longest = max(height, width)
+    if max_side <= 0 or longest <= max_side:
+        return frame, 1.0
+    ratio = max_side / longest
+    new_w = max(1, int(round(width * ratio)))
+    new_h = max(1, int(round(height * ratio)))
+    try:
+        import cv2
+    except ImportError:
+        return frame, 1.0
+    resized = cv2.resize(frame.image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    scaled = VideoFrame(
+        image=resized,
+        timestamp=frame.timestamp,
+        frame_index=frame.frame_index,
+        source_id=frame.source_id,
+        fps=frame.fps,
+    )
+    return scaled, 1.0 / ratio
+
+
+def _upscale_detections(
+    detections: list[Detection],
+    scale: float,
+    width: int,
+    height: int,
+) -> list[Detection]:
+    if scale == 1.0 or not detections:
+        return detections
+    out: list[Detection] = []
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        bbox = (
+            int(round(x1 * scale)),
+            int(round(y1 * scale)),
+            int(round(x2 * scale)),
+            int(round(y2 * scale)),
+        )
+        bbox = clamp_bbox(bbox, width, height)
+        out.append(
+            Detection(
+                label=det.label,
+                confidence=det.confidence,
+                bbox=bbox,
+                mask=det.mask,
+                track_id=det.track_id,
+                metadata=det.metadata,
+            )
+        )
+    return out
 
 
 class StreamProcessor:
@@ -31,19 +92,13 @@ class StreamProcessor:
         self,
         config: AppConfig,
         provider: InferenceProvider,
-        label_proposer: SceneLabelProposer | None,
         recorder: ClipRecorder | None,
     ) -> None:
         self.config = config
         self.provider = provider
-        self.label_proposer = label_proposer
         self.recorder = recorder
         self.recording_enabled = True
 
-        self._inventory = LabelStabilizer(
-            required_samples=config.inventory.required_samples,
-            max_labels=config.inventory.max_labels,
-        )
         self._tracker = TrackManager(
             min_iou=config.thresholds.tracking_iou,
             min_area_ratio=config.thresholds.min_area_ratio,
@@ -52,10 +107,24 @@ class StreamProcessor:
             person_confirmation_frames=config.timings.person_confirmation_frames,
             empty_scene_rescan_seconds=config.timings.empty_scene_rescan_seconds,
         )
-        self._inventory_items: list[InventoryItem] = []
-        self._last_inventory_sample = float("-inf")
+        self._inventory_items: list[InventoryItem] = _inventory_items_from_labels(
+            config.inventory.labels
+        )
         self._tracking_live = False
         self._event_person_ids: set[str] = set()
+
+        self._stage_samples: dict[str, deque[float]] = {
+            stage: deque(maxlen=_TIMING_WINDOW) for stage in _TIMING_STAGES
+        }
+        self._frame_wall_times: deque[float] = deque(maxlen=_TIMING_WINDOW)
+        self._last_log_time = 0.0
+
+        # Inference rate-limiter: run the provider at most once per interval,
+        # reusing the last detections on in-between frames so the overlay and
+        # recording still advance at the consumer's full rate.
+        self._last_inference_ts: float = -1.0e9
+        self._cached_people_candidates: list[Detection] = []
+        self._cached_inventory_detections: list[Detection] = []
 
     def request_manual_rescan(self) -> None:
         self._state_machine.request_manual_rescan()
@@ -63,11 +132,32 @@ class StreamProcessor:
     def set_recording_enabled(self, enabled: bool) -> None:
         self.recording_enabled = enabled
 
+    def update_labels(self, labels: list[str]) -> None:
+        self.config.inventory.labels = list(labels)
+        self._inventory_items = _inventory_items_from_labels(labels)
+
     def process_frame(self, frame: VideoFrame) -> PipelineSnapshot:
-        if self._tracking_live and self._state_machine.mode in {"person_present", "cooldown"}:
-            people_candidates = self.provider.track_next(frame)
+        frame_start = time.perf_counter()
+
+        inference_start = time.perf_counter()
+        interval_s = max(0.0, self.config.models.inference_interval_ms / 1000.0)
+        should_run_inference = (frame.timestamp - self._last_inference_ts) >= interval_s
+
+        inf_frame: VideoFrame | None = None
+        scale = 1.0
+        if should_run_inference:
+            inf_frame, scale = _downscale_for_inference(
+                frame, self.config.models.inference_max_side
+            )
+            if self._tracking_live and self._state_machine.mode in {"person_present", "cooldown"}:
+                people_candidates = self.provider.track_next(inf_frame)
+            else:
+                people_candidates = self.provider.detect_text_prompts(inf_frame, list(PEOPLE_PROMPTS))
+            people_candidates = _upscale_detections(people_candidates, scale, frame.width, frame.height)
+            self._cached_people_candidates = list(people_candidates)
+            self._last_inference_ts = frame.timestamp
         else:
-            people_candidates = self.provider.detect_text_prompts(frame, list(PEOPLE_PROMPTS))
+            people_candidates = list(self._cached_people_candidates)
 
         people_candidates = self._normalize_people(people_candidates)
         tracked_people = self._tracker.update(people_candidates, frame)
@@ -79,35 +169,44 @@ class StreamProcessor:
             auto_rescan_enabled=self.config.inventory.auto_rescan,
         )
 
-        if decision.inventory_reset:
-            self._inventory.reset()
-            self._inventory_items = []
-            self._last_inventory_sample = float("-inf")
-
         if decision.event_started:
             self._tracking_live = True
             self._event_person_ids.clear()
-            self.provider.start_tracking(frame, list(PEOPLE_PROMPTS))
+            # start_tracking itself triggers an inference pass; ensure the frame
+            # fed in matches the downscaling contract and reset the interval timer.
+            start_frame = inf_frame
+            if start_frame is None:
+                start_frame, _ = _downscale_for_inference(
+                    frame, self.config.models.inference_max_side
+                )
+            self.provider.start_tracking(start_frame, list(PEOPLE_PROMPTS))
+            self._last_inference_ts = frame.timestamp
 
+        inventory_labels = [item.label for item in self._inventory_items]
         inventory_detections: list[Detection] = []
-        if decision.mode == "inventory" and decision.inventory_active and not people_present:
-            if (
-                self.label_proposer is not None
-                and (frame.timestamp - self._last_inventory_sample) >= self.config.timings.inventory_sample_seconds
-            ):
-                proposals = self.label_proposer.propose(frame.image)
-                self._inventory_items = self._inventory.observe(proposals, frame.timestamp)
-                self._last_inventory_sample = frame.timestamp
-
-            if self._inventory.labels:
-                inventory_detections = self.provider.detect_text_prompts(frame, self._inventory.labels)
+        inventory_eligible = (
+            decision.mode == "inventory"
+            and decision.inventory_active
+            and not people_present
+            and bool(inventory_labels)
+        )
+        if inventory_eligible:
+            if should_run_inference and inf_frame is not None:
+                inventory_raw = self.provider.detect_text_prompts(inf_frame, inventory_labels)
+                inventory_raw = _upscale_detections(
+                    inventory_raw, scale, frame.width, frame.height
+                )
                 inventory_detections = [
                     detection
-                    for detection in inventory_detections
+                    for detection in inventory_raw
                     if detection.confidence >= self.config.thresholds.inventory_confidence
                 ]
+                self._cached_inventory_detections = list(inventory_detections)
+            else:
+                inventory_detections = list(self._cached_inventory_detections)
         else:
-            inventory_detections = []
+            self._cached_inventory_detections = []
+        inference_ms = (time.perf_counter() - inference_start) * 1000.0
 
         if tracked_people:
             self._event_person_ids.update(
@@ -117,6 +216,11 @@ class StreamProcessor:
         visible_detections = tracked_people if decision.mode in {"person_present", "cooldown"} else inventory_detections
         status_text = self._status_text(decision.mode, tracked_people, self._inventory_items)
 
+        # Build an early snapshot of timings so the HUD shows recent history.
+        hud_timings = self._current_timings()
+        hud_fps = self._current_fps()
+
+        overlay_start = time.perf_counter()
         overlay = render_overlay(
             frame.image,
             detections=visible_detections,
@@ -125,8 +229,12 @@ class StreamProcessor:
             inventory_active=decision.inventory_active,
             recording_active=bool(self.recorder and self.recorder.recording_active),
             status_text=status_text,
+            hud_timings=hud_timings,
+            hud_fps=hud_fps,
         )
+        overlay_ms = (time.perf_counter() - overlay_start) * 1000.0
 
+        recorder_start = time.perf_counter()
         completed_clips: list[Path] = []
         if self.recorder is not None and self.recording_enabled:
             if decision.event_started:
@@ -136,7 +244,9 @@ class StreamProcessor:
                 self.recorder.finish_event(frame.timestamp, sorted(self._event_person_ids))
                 self._tracking_live = False
                 self._tracker.reset()
-            artifacts = self.recorder.push_frame(frame, overlay)
+            # Frame write happens on the producer thread (see StreamRuntime._produce_loop);
+            # here we only pick up clips that have finalized in the meantime.
+            artifacts = self.recorder.drain_completed()
             completed_clips = [artifact.clip_path for artifact in artifacts]
             if completed_clips:
                 self._event_person_ids.clear()
@@ -144,6 +254,24 @@ class StreamProcessor:
             self._tracking_live = False
             self._tracker.reset()
             self._event_person_ids.clear()
+        recorder_ms = (time.perf_counter() - recorder_start) * 1000.0
+
+        total_ms = (time.perf_counter() - frame_start) * 1000.0
+        self._record_frame(
+            wall_time=time.perf_counter(),
+            inference_ms=inference_ms,
+            overlay_ms=overlay_ms,
+            recorder_ms=recorder_ms,
+            total_ms=total_ms,
+        )
+        timings = self._current_timings()
+        effective_fps = self._current_fps()
+        self._maybe_log_timings(
+            timings,
+            effective_fps,
+            mode=decision.mode,
+            frame_shape=frame.image.shape,
+        )
 
         return PipelineSnapshot(
             mode=decision.mode,
@@ -157,6 +285,61 @@ class StreamProcessor:
             recording_active=bool(self.recorder and self.recorder.recording_active),
             completed_clips=completed_clips,
             status_text=status_text,
+            timings=timings,
+            effective_fps=effective_fps,
+        )
+
+    def _record_frame(
+        self,
+        *,
+        wall_time: float,
+        inference_ms: float,
+        overlay_ms: float,
+        recorder_ms: float,
+        total_ms: float,
+    ) -> None:
+        self._frame_wall_times.append(wall_time)
+        self._stage_samples["inference"].append(inference_ms)
+        self._stage_samples["overlay"].append(overlay_ms)
+        self._stage_samples["recorder"].append(recorder_ms)
+        self._stage_samples["total"].append(total_ms)
+
+    def _current_timings(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for stage, samples in self._stage_samples.items():
+            out[stage] = (sum(samples) / len(samples)) if samples else 0.0
+        return out
+
+    def _current_fps(self) -> float:
+        if len(self._frame_wall_times) < 2:
+            return 0.0
+        span = self._frame_wall_times[-1] - self._frame_wall_times[0]
+        if span <= 0.0:
+            return 0.0
+        return (len(self._frame_wall_times) - 1) / span
+
+    def _maybe_log_timings(
+        self,
+        timings: dict[str, float],
+        fps: float,
+        *,
+        mode: str,
+        frame_shape: tuple[int, ...],
+    ) -> None:
+        now = time.perf_counter()
+        if now - self._last_log_time < 1.0:
+            return
+        self._last_log_time = now
+        height, width = frame_shape[0], frame_shape[1]
+        print(
+            f"[meta-watcher] fps={fps:.1f} "
+            f"infer={timings['inference']:.1f}ms "
+            f"overlay={timings['overlay']:.1f}ms "
+            f"recorder={timings['recorder']:.1f}ms "
+            f"total={timings['total']:.1f}ms "
+            f"mode={mode} frame={width}x{height}",
+            file=sys.stderr,
+            flush=True,
         )
 
     def _normalize_people(self, detections: list[Detection]) -> list[Detection]:
@@ -184,6 +367,16 @@ class StreamProcessor:
         return f"tracked people: {len(people)}"
 
 
+def _inventory_items_from_labels(labels: list[str]) -> list[InventoryItem]:
+    items: list[InventoryItem] = []
+    for raw in labels:
+        label = normalize_label(raw)
+        if not label or is_people_label(label):
+            continue
+        items.append(InventoryItem(label=label, confidence=1.0, samples=1, last_seen=0.0))
+    return items
+
+
 class StreamRuntime:
     def __init__(
         self,
@@ -192,12 +385,14 @@ class StreamRuntime:
         *,
         on_snapshot: Callable[[PipelineSnapshot], None],
         on_error: Callable[[str], None],
+        on_raw_frame: Callable[[VideoFrame], None] | None = None,
         queue_size: int = 2,
     ) -> None:
         self.source = source
         self.processor = processor
         self.on_snapshot = on_snapshot
         self.on_error = on_error
+        self.on_raw_frame = on_raw_frame
         self.queue: queue.Queue[VideoFrame] = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
         self._producer: threading.Thread | None = None
@@ -238,6 +433,19 @@ class StreamRuntime:
                 frame = self.source.read()
                 if frame is None:
                     break
+                if self.on_raw_frame is not None:
+                    try:
+                        self.on_raw_frame(frame)
+                    except Exception:
+                        pass
+                # Recording tap: capture every camera frame at camera rate,
+                # independent of the inference-gated consumer thread.
+                recorder = self.processor.recorder
+                if recorder is not None and self.processor.recording_enabled:
+                    try:
+                        recorder.push_frame(frame)
+                    except Exception:
+                        pass
                 self._put_latest(frame)
                 if getattr(self.source, "live", True) is False and frame.fps:
                     time.sleep(max(0.0, 1.0 / frame.fps))

@@ -11,7 +11,6 @@ import numpy as np
 from meta_watcher.core import (
     ClipRecorder,
     Detection,
-    LabelStabilizer,
     StreamStateMachine,
     TrackManager,
     VideoFrame,
@@ -59,13 +58,6 @@ class CoreTests(unittest.TestCase):
     def test_normalize_label(self) -> None:
         self.assertEqual(normalize_label("The Chairs"), "chair")
         self.assertEqual(normalize_label("An office lamp"), "office lamp")
-
-    def test_label_stabilizer_requires_repeated_samples(self) -> None:
-        stabilizer = LabelStabilizer(required_samples=3, max_labels=12)
-        self.assertEqual(stabilizer.observe({"chair": 0.7}, 1.0), [])
-        self.assertEqual(stabilizer.observe({"chair": 0.8, "person": 0.9}, 2.0), [])
-        items = stabilizer.observe({"chairs": 0.9}, 3.0)
-        self.assertEqual([item.label for item in items], ["chair"])
 
     def test_track_manager_reuses_ids(self) -> None:
         tracker = TrackManager(min_iou=0.1, max_missed_frames=2)
@@ -116,16 +108,54 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(metadata["inventory"], ["chair", "lamp"])
             self.assertEqual(metadata["person_ids"], ["person-1"])
 
-    def test_webcam_source_falls_back_from_configured_index(self) -> None:
+    def test_webcam_source_only_probes_requested_index(self) -> None:
         class FakeCapture:
             def __init__(self, index: int) -> None:
                 self.index = index
 
             def isOpened(self) -> bool:
-                return self.index == 2
+                return True
 
             def read(self):
-                if self.index == 2:
+                return True, np.zeros((32, 32, 3), dtype=np.uint8)
+
+            def set(self, prop, value) -> bool:
+                return True
+
+            def get(self, prop) -> float:
+                return 30.0
+
+            def release(self) -> None:
+                return None
+
+        source = WebcamSource("3")
+        fake_cv2 = mock.Mock(CAP_PROP_FRAME_WIDTH=3, CAP_PROP_FRAME_HEIGHT=4, CAP_PROP_FPS=5)
+        source._cv2 = fake_cv2
+        source._load_cv2 = mock.Mock(return_value=fake_cv2)
+        probed: list[int] = []
+
+        def opener(index: int) -> FakeCapture:
+            probed.append(index)
+            return FakeCapture(index)
+
+        source._open_capture = opener
+        source.open()
+
+        self.assertEqual(probed, [3])
+        self.assertEqual(source.capture_value, 3)
+        self.assertIsNotNone(source._capture)
+
+    def test_webcam_source_auto_uses_enumeration(self) -> None:
+        class FakeCapture:
+            def __init__(self, index: int, works: bool) -> None:
+                self.index = index
+                self.works = works
+
+            def isOpened(self) -> bool:
+                return self.works
+
+            def read(self):
+                if self.works:
                     return True, np.zeros((32, 32, 3), dtype=np.uint8)
                 return False, None
 
@@ -138,15 +168,22 @@ class CoreTests(unittest.TestCase):
             def release(self) -> None:
                 return None
 
-        source = WebcamSource("0")
+        source = WebcamSource("auto")
         fake_cv2 = mock.Mock(CAP_PROP_FRAME_WIDTH=3, CAP_PROP_FRAME_HEIGHT=4, CAP_PROP_FPS=5)
         source._cv2 = fake_cv2
         source._load_cv2 = mock.Mock(return_value=fake_cv2)
-        source._open_capture = mock.Mock(side_effect=lambda index: FakeCapture(index))
 
-        source.open()
+        from meta_watcher import sources as sources_module
 
-        self.assertEqual(source.capture_value, 2)
+        with mock.patch.object(
+            sources_module,
+            "_list_linux_webcams",
+            return_value=[sources_module.WebcamDevice(index=7, label="cam", path="/dev/video7")],
+        ), mock.patch("meta_watcher.sources.sys.platform", "linux"):
+            source._open_capture = mock.Mock(side_effect=lambda index: FakeCapture(index, index == 7))
+            source.open()
+
+        self.assertEqual(source.capture_value, 7)
         self.assertIsNotNone(source._capture)
 
 

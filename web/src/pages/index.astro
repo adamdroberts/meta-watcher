@@ -1,0 +1,20 @@
+---
+import "../styles/global.css";
+import VideoPanel from "../components/VideoPanel.astro";
+import ControlPanel from "../components/ControlPanel.astro";
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Meta Watcher</title>
+  </head>
+  <body>
+    <main class="layout">
+      <VideoPanel />
+      <ControlPanel />
+    </main>
+    <script src="../scripts/app.ts"></script>
+  </body>
+</html>
