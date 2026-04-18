@@ -2,15 +2,18 @@
   "source": {
     "kind": "webcam",
     "value": "0",
-    "width": 1280,
-    "height": 720,
-    "fps": 30
+    "width": 1920,
+    "height": 1080,
+    "fps": 60
   },
   "models": {
+    "provider": "detr-resnet-50",
     "mac_sam_model_id": "mlx-community/sam3.1-bf16",
     "linux_sam_model_id": "facebook/sam3.1",
+    "detr_model_id": "facebook/detr-resnet-50",
+    "rt_detr_model_id": "jadechoghari/RT-DETRv2",
     "inference_max_side": 960,
-    "inference_interval_ms": 200
+    "inference_interval_ms": 16
   },
   "thresholds": {
     "person_confidence": 0.3,
@@ -30,6 +33,30 @@
     "auto_rescan": true
   },
   "output": {
-    "directory": "recordings"
+    "directory": "recordings",
+    "recording_mode": "both"
+  },
+  "upload": {
+    "enabled": false,
+    "provider": "gcp",
+    "bucket": "",
+    "prefix": "meta-watcher/",
+    "credentials_path": "",
+    "region": "",
+    "upload_videos": true,
+    "upload_snapshots": true,
+    "upload_metadata": true,
+    "delete_after_upload": false,
+    "queue_size": 32
+  },
+  "timestamps": {
+    "enabled": false,
+    "ots_binary": "ots",
+    "calendar_urls": [],
+    "timeout_seconds": 30.0,
+    "stamp_videos": true,
+    "stamp_snapshots": true,
+    "stamp_frames": false,
+    "stamp_metadata": false
   }
 }

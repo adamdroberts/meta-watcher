@@ -380,6 +380,12 @@ class RuntimeStateLiveUploadTests(unittest.TestCase):
         uploader = FakeUploader()
         recorder = FakeRecorder()
 
+        # _write_live_frame now writes under config.output.directory. Point
+        # that at a tempdir so the test never drops files into the repo.
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        state.update_config({"output": {"directory": tempdir.name}})
+
         # First call: should fire snapshot + frame (last_mono was 0.0).
         state._pump_live_uploads(b"jpegbytes", uploader, recorder)  # type: ignore[arg-type]
         # Immediate second call: snapshot already recorded, and 0.5s has NOT
@@ -486,13 +492,40 @@ class LiveUploadPathsTests(unittest.TestCase):
                 ["meta/cam_evt/cam_evt.jpg"],
             )
 
-    def test_enqueue_frame_uses_frames_subfolder_and_deletes(self) -> None:
+    def test_enqueue_frame_uses_frames_subfolder_and_keeps_local(self) -> None:
         provider = FakeProvider()
-        uploader = self._build(provider, delete_after_upload=False)  # global default off
+        # Global delete_after_upload off (the default): frames must stay on
+        # disk so operators have a complete local record alongside the clip.
+        uploader = self._build(provider, delete_after_upload=False)
         uploader.start()
         try:
             with tempfile.TemporaryDirectory() as tempdir:
                 frame = Path(tempdir) / "cam_evt_live_001.jpg"
+                frame.write_bytes(b"x")
+                uploader.enqueue_frame(frame, "cam_evt")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with provider.lock:
+                        if provider.calls:
+                            break
+                    time.sleep(0.02)
+                # Give the worker a beat to run its (no-op) delete branch.
+                time.sleep(0.1)
+                with provider.lock:
+                    keys = [key for _, key in provider.calls]
+                self.assertEqual(keys, ["meta/cam_evt/frames/cam_evt_live_001.jpg"])
+                # Kept on disk — operator still has the frame after upload.
+                self.assertTrue(frame.exists())
+        finally:
+            uploader.stop(timeout=2.0)
+
+    def test_enqueue_frame_respects_global_delete_flag(self) -> None:
+        provider = FakeProvider()
+        uploader = self._build(provider, delete_after_upload=True)
+        uploader.start()
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                frame = Path(tempdir) / "cam_evt_live_002.jpg"
                 frame.write_bytes(b"x")
                 uploader.enqueue_frame(frame, "cam_evt")
                 deadline = time.monotonic() + 2.0
@@ -501,11 +534,24 @@ class LiveUploadPathsTests(unittest.TestCase):
         finally:
             uploader.stop(timeout=2.0)
 
-        with provider.lock:
-            keys = [key for _, key in provider.calls]
-        self.assertEqual(keys, ["meta/cam_evt/frames/cam_evt_live_001.jpg"])
-        # Frames are ephemeral: deleted after successful upload even when the
-        # global delete_after_upload flag is False.
+        self.assertFalse(frame.exists(), "global delete flag should still drop frames")
+
+    def test_enqueue_frame_delete_override(self) -> None:
+        provider = FakeProvider()
+        # Global keep, but caller explicitly requests delete — still deletes.
+        uploader = self._build(provider, delete_after_upload=False)
+        uploader.start()
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                frame = Path(tempdir) / "cam_evt_live_003.jpg"
+                frame.write_bytes(b"x")
+                uploader.enqueue_frame(frame, "cam_evt", delete_after_upload=True)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and frame.exists():
+                    time.sleep(0.02)
+        finally:
+            uploader.stop(timeout=2.0)
+
         self.assertFalse(frame.exists())
 
     def test_enqueue_artifact_skip_snapshot(self) -> None:

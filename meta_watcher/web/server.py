@@ -13,7 +13,7 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 from ..sources import list_webcams
-from .state import RuntimeState, placeholder_jpeg
+from .state import ConfigPathError, ConfigValidationError, RuntimeState, placeholder_jpeg
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -32,8 +32,71 @@ def build_app(state: RuntimeState) -> FastAPI:
         patch = await request.json()
         if not isinstance(patch, dict):
             return JSONResponse({"error": "Config patch must be a JSON object."}, status_code=400)
-        updated = state.update_config(patch)
+        try:
+            updated = state.update_config(patch)
+        except ConfigValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(asdict(updated))
+
+    @app.get("/api/config/files")
+    def list_config_files() -> JSONResponse:
+        active = state.active_config_path()
+        return JSONResponse(
+            {
+                "active": str(active) if active is not None else None,
+                "files": state.list_config_files(),
+            }
+        )
+
+    @app.post("/api/config/switch")
+    async def switch_config(request: Request) -> JSONResponse:
+        body = await request.json() if request.headers.get("content-length") else {}
+        if not isinstance(body, dict) or "path" not in body:
+            return JSONResponse(
+                {"error": "Body must be a JSON object with a 'path' field."}, status_code=400
+            )
+        try:
+            loaded = state.reload_config(body["path"])
+        except FileNotFoundError as exc:
+            return JSONResponse({"error": f"Config file not found: {exc}"}, status_code=404)
+        except ConfigPathError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        except ConfigValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        active = state.active_config_path()
+        running = state.is_running()
+        return JSONResponse(
+            {
+                "config": asdict(loaded),
+                "active": str(active) if active is not None else None,
+                "running": running,
+                "requires_restart": running,
+            }
+        )
+
+    @app.post("/api/config/save")
+    async def save_config_endpoint(request: Request) -> JSONResponse:
+        body: Any = {}
+        if request.headers.get("content-length"):
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+        path_override = body.get("path") if isinstance(body, dict) else None
+        try:
+            written = state.save_active_config(path_override)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except ConfigPathError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        except OSError as exc:
+            return JSONResponse({"error": f"Failed to write config: {exc}"}, status_code=500)
+        return JSONResponse(
+            {
+                "path": str(written),
+                "bytes_written": written.stat().st_size,
+            }
+        )
 
     @app.get("/api/snapshot")
     def get_snapshot() -> JSONResponse:

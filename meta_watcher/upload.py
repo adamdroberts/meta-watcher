@@ -230,12 +230,20 @@ class EventUploader:
             self._job_for(snapshot_path, event_id, stamp=self._timestamps.stamp_snapshots)
         )
 
-    def enqueue_frame(self, local_path: Path, event_id: str, *, delete_after_upload: bool = True) -> None:
+    def enqueue_frame(
+        self,
+        local_path: Path,
+        event_id: str,
+        *,
+        delete_after_upload: bool | None = None,
+    ) -> None:
         """Enqueue a live frame captured mid-event.
 
         Keyed under `{prefix}{event_id}/frames/{file.name}` so periodic frames
-        group alongside the event's clip + snapshot. These are ephemeral by
-        default — `delete_after_upload=True` regardless of the global config.
+        group alongside the event's clip + snapshot. `delete_after_upload=None`
+        (the default) inherits the global upload config — frames are kept on
+        disk alongside the clip + snapshot by default so operators have a
+        complete local record. Pass `True` to explicitly make frames ephemeral.
         """
         remote_key = f"{self._config.prefix}{event_id}/frames/{local_path.name}"
         self._enqueue_drop_oldest(
