@@ -13,6 +13,7 @@ from .core import (
     PEOPLE_PROMPTS,
     ClipRecorder,
     Detection,
+    EventArtifact,
     InventoryItem,
     PipelineSnapshot,
     StreamStateMachine,
@@ -235,7 +236,7 @@ class StreamProcessor:
         overlay_ms = (time.perf_counter() - overlay_start) * 1000.0
 
         recorder_start = time.perf_counter()
-        completed_clips: list[Path] = []
+        completed_clips: list[EventArtifact] = []
         if self.recorder is not None and self.recording_enabled:
             if decision.event_started:
                 self.recorder.start_event(frame, [item.label for item in self._inventory_items])
@@ -244,10 +245,12 @@ class StreamProcessor:
                 self.recorder.finish_event(frame.timestamp, sorted(self._event_person_ids))
                 self._tracking_live = False
                 self._tracker.reset()
-            # Frame write happens on the producer thread (see StreamRuntime._produce_loop);
-            # here we only pick up clips that have finalized in the meantime.
+            # Raw frames come from the producer thread (StreamRuntime._produce_loop);
+            # the overlay channel is fed here, at consumer rate, and is a no-op when
+            # the recorder is configured for "raw" only.
+            self.recorder.push_overlay_frame(frame, overlay)
             artifacts = self.recorder.drain_completed()
-            completed_clips = [artifact.clip_path for artifact in artifacts]
+            completed_clips = list(artifacts)
             if completed_clips:
                 self._event_person_ids.clear()
         elif decision.event_finished:

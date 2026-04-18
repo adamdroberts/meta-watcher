@@ -1,0 +1,22 @@
+---
+import "../styles/global.css";
+import SettingsForm from "../components/SettingsForm.astro";
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Meta Watcher — Settings</title>
+  </head>
+  <body>
+    <main class="settings-layout">
+      <header class="settings-header">
+        <a class="settings-nav" href="/">&larr; Back to live</a>
+        <h1>Settings</h1>
+      </header>
+      <SettingsForm />
+    </main>
+    <script src="../scripts/settings.ts"></script>
+  </body>
+</html>

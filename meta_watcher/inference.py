@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 from .config import ModelConfig
-from .core import Detection, PEOPLE_PROMPTS, VideoFrame, clamp_bbox
+from .core import Detection, PEOPLE_PROMPTS, VideoFrame, clamp_bbox, normalize_label
 
 
 class InferenceProvider(ABC):
@@ -241,7 +241,160 @@ class CudaSam31Provider(InferenceProvider):
         self._device = None
 
 
+def _matches_any_prompt(label: str, prompts: Iterable[str]) -> bool:
+    """Loose match a closed-vocabulary class name (e.g. "dining table")
+    against user-supplied prompts (e.g. "table"). Both sides are run through
+    ``normalize_label`` and then compared in both directions so that
+    multi-word COCO labels line up with short prompts.
+    """
+    normalized_label = normalize_label(label)
+    if not normalized_label:
+        return False
+    for prompt in prompts:
+        normalized_prompt = normalize_label(prompt)
+        if not normalized_prompt:
+            continue
+        if normalized_prompt == normalized_label:
+            return True
+        if normalized_prompt in normalized_label:
+            return True
+        if normalized_label in normalized_prompt:
+            return True
+    return False
+
+
+class TransformersObjectDetectionProvider(InferenceProvider):
+    """Object detection backed by a HuggingFace ``transformers`` model.
+
+    Works with closed-vocabulary COCO detectors such as
+    ``facebook/detr-resnet-50`` and ``jadechoghari/RT-DETRv2``. Detections
+    are filtered against the caller's prompt list using
+    :func:`_matches_any_prompt` since these models do not accept free-form
+    text prompts. No segmentation masks are produced.
+    """
+
+    MISSING_DEPENDENCY_MESSAGE = (
+        "Transformers-based object detection requires the `transformers` and "
+        "`torch` packages. Reinstall with "
+        '`python3 -m pip install -e ".[desktop,detr]"`.'
+    )
+
+    def __init__(self, model_id: str, *, score_threshold: float = 0.05) -> None:
+        self.model_id = model_id
+        self.score_threshold = float(score_threshold)
+        self._model: Any | None = None
+        self._processor: Any | None = None
+        self._device: Any | None = None
+        self._tracking_prompts: list[str] = list(PEOPLE_PROMPTS)
+
+    def warmup(self) -> None:
+        if self._model is not None:
+            return
+        try:
+            from transformers import AutoImageProcessor, AutoModelForObjectDetection
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(self.MISSING_DEPENDENCY_MESSAGE) from exc
+
+        # ``trust_remote_code=True`` is required for community repos like
+        # ``jadechoghari/RT-DETRv2`` that ship their own modeling files.
+        # Users opted into this backend via config, so enabling it here is
+        # appropriate.
+        processor = AutoImageProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+        model = AutoModelForObjectDetection.from_pretrained(self.model_id, trust_remote_code=True)
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif (
+            sys.platform == "darwin"
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+        model = model.to(device)
+        model.train(False)
+
+        self._processor = processor
+        self._model = model
+        self._device = device
+
+    def detect_text_prompts(
+        self, frame: VideoFrame, prompts: list[str] | tuple[str, ...]
+    ) -> list[Detection]:
+        self.warmup()
+        assert self._model is not None and self._processor is not None
+        import torch
+
+        image = Image.fromarray(frame.image)
+        inputs = self._processor(images=image, return_tensors="pt")
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(self._device)
+
+        with torch.inference_mode():
+            outputs = self._model(**inputs)
+
+        target_sizes = [(frame.height, frame.width)]
+        results = self._processor.post_process_object_detection(
+            outputs,
+            threshold=self.score_threshold,
+            target_sizes=target_sizes,
+        )
+        if not results:
+            return []
+        result = results[0]
+
+        id2label = getattr(self._model.config, "id2label", {}) or {}
+        scores = _to_numpy(result.get("scores", []), dtype=float)
+        label_ids = _to_numpy(result.get("labels", []))
+        boxes = _to_numpy(result.get("boxes", []))
+
+        detections: list[Detection] = []
+        for index, score in enumerate(scores.tolist()):
+            if index >= len(label_ids) or boxes.size == 0 or index >= len(boxes):
+                continue
+            label_id = int(label_ids[index])
+            label_name = str(id2label.get(label_id, id2label.get(str(label_id), label_id)))
+            if not _matches_any_prompt(label_name, prompts):
+                continue
+            detections.append(
+                Detection(
+                    label=label_name,
+                    confidence=float(score),
+                    bbox=_box_tuple(boxes[index], frame),
+                    mask=None,
+                )
+            )
+        return detections
+
+    def start_tracking(
+        self, frame: VideoFrame, prompts: list[str] | tuple[str, ...]
+    ) -> list[Detection]:
+        self._tracking_prompts = list(prompts)
+        return self.detect_text_prompts(frame, prompts)
+
+    def track_next(self, frame: VideoFrame) -> list[Detection]:
+        return self.detect_text_prompts(frame, self._tracking_prompts)
+
+    def shutdown(self) -> None:
+        self._model = None
+        self._processor = None
+        self._device = None
+
+
 def build_provider(models: ModelConfig) -> InferenceProvider:
+    provider = getattr(models, "provider", "sam3.1")
+    if provider == "detr-resnet-50":
+        return TransformersObjectDetectionProvider(models.detr_model_id)
+    if provider == "rt-detrv2":
+        return TransformersObjectDetectionProvider(models.rt_detr_model_id)
+    if provider != "sam3.1":
+        raise ValueError(
+            f"Unknown inference provider {provider!r}. Expected one of: "
+            "'sam3.1', 'detr-resnet-50', 'rt-detrv2'."
+        )
     machine = platform.machine().lower()
     if sys.platform == "darwin" and machine in {"arm64", "aarch64"}:
         return MlxSubprocessSam31Provider(models.mac_sam_model_id)

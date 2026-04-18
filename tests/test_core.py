@@ -108,6 +108,115 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(metadata["inventory"], ["chair", "lamp"])
             self.assertEqual(metadata["person_ids"], ["person-1"])
 
+    def test_clip_recorder_overlay_mode_writes_only_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            sink_factory = MemorySinkFactory()
+            recorder = ClipRecorder(
+                tempdir,
+                pre_roll_seconds=0.0,
+                post_roll_seconds=0.0,
+                sink_factory=sink_factory,
+                mode="overlay",
+            )
+
+            raw_px = np.zeros((64, 64, 3), dtype=np.uint8)
+            overlay_px = np.full((64, 64, 3), 200, dtype=np.uint8)
+
+            event_frame = make_frame(0)
+            recorder.start_event(event_frame, ["chair"])
+            # Producer still calls push_frame unconditionally; in overlay-only
+            # mode it must be a safe no-op.
+            recorder.push_frame(event_frame, raw_px)
+            recorder.push_overlay_frame(event_frame, overlay_px)
+            recorder.finish_event(0.5, ["person-1"])
+            artifacts = recorder.push_overlay_frame(make_frame(1), overlay_px)
+
+            self.assertEqual(len(sink_factory.sinks), 1)
+            self.assertEqual(len(artifacts), 1)
+            art = artifacts[0]
+            self.assertTrue(str(art.clip_path).endswith(".mp4"))
+            self.assertFalse(str(art.clip_path).endswith(".overlay.mp4"))
+            self.assertIsNone(art.overlay_clip_path)
+            # Every sink frame is the overlay pixels, never the raw pixels.
+            for frame_image in sink_factory.sinks[0].frames:
+                self.assertTrue(np.array_equal(frame_image, overlay_px))
+
+    def test_clip_recorder_both_mode_writes_two_sinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            sink_factory = MemorySinkFactory()
+            recorder = ClipRecorder(
+                tempdir,
+                pre_roll_seconds=0.0,
+                post_roll_seconds=0.0,
+                sink_factory=sink_factory,
+                mode="both",
+            )
+
+            raw_px = np.zeros((64, 64, 3), dtype=np.uint8)
+            overlay_px = np.full((64, 64, 3), 200, dtype=np.uint8)
+
+            event_frame = make_frame(0)
+            recorder.start_event(event_frame, ["chair"])
+            recorder.push_frame(event_frame, raw_px)
+            recorder.push_overlay_frame(event_frame, overlay_px)
+            recorder.finish_event(0.5, ["person-1"])
+            recorder.push_overlay_frame(make_frame(1), overlay_px)
+            artifacts = recorder.push_frame(make_frame(1), raw_px)
+
+            self.assertEqual(len(sink_factory.sinks), 2)
+            self.assertEqual(len(artifacts), 1)
+            art = artifacts[0]
+            self.assertEqual(art.clip_path.suffix, ".mp4")
+            self.assertFalse(str(art.clip_path).endswith(".overlay.mp4"))
+            self.assertIsNotNone(art.overlay_clip_path)
+            assert art.overlay_clip_path is not None
+            self.assertTrue(str(art.overlay_clip_path).endswith(".overlay.mp4"))
+            self.assertEqual(art.clip_path.stem, art.overlay_clip_path.stem.rsplit(".", 1)[0])
+
+            raw_sink = next(
+                s for s in sink_factory.sinks if str(s.path) == str(art.clip_path)
+            )
+            overlay_sink = next(
+                s for s in sink_factory.sinks if str(s.path) == str(art.overlay_clip_path)
+            )
+            # Raw sink only ever sees raw pixels; overlay sink only overlay.
+            for frame_image in raw_sink.frames:
+                self.assertTrue(np.array_equal(frame_image, raw_px))
+            for frame_image in overlay_sink.frames:
+                self.assertTrue(np.array_equal(frame_image, overlay_px))
+
+            metadata = json.loads(Path(art.metadata_path).read_text(encoding="utf-8"))
+            self.assertEqual(metadata["raw_clip_path"], str(art.clip_path))
+            self.assertEqual(metadata["overlay_clip_path"], str(art.overlay_clip_path))
+
+    def test_clip_recorder_raw_mode_ignores_overlay_pushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            sink_factory = MemorySinkFactory()
+            recorder = ClipRecorder(
+                tempdir,
+                pre_roll_seconds=0.0,
+                post_roll_seconds=0.0,
+                sink_factory=sink_factory,
+                mode="raw",
+            )
+
+            event_frame = make_frame(0)
+            recorder.start_event(event_frame, ["chair"])
+            # Overlay pushes on a raw-only recorder must be no-ops.
+            recorder.push_overlay_frame(event_frame, np.full((64, 64, 3), 200, dtype=np.uint8))
+            recorder.push_frame(event_frame, np.zeros((64, 64, 3), dtype=np.uint8))
+            recorder.finish_event(0.5, [])
+            artifacts = recorder.push_frame(make_frame(1), np.zeros((64, 64, 3), dtype=np.uint8))
+
+            self.assertEqual(len(sink_factory.sinks), 1)
+            self.assertEqual(len(artifacts), 1)
+            self.assertIsNone(artifacts[0].overlay_clip_path)
+
+    def test_clip_recorder_rejects_unknown_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            with self.assertRaises(ValueError):
+                ClipRecorder(tempdir, mode="nope")
+
     def test_webcam_source_only_probes_requested_index(self) -> None:
         class FakeCapture:
             def __init__(self, index: int) -> None:

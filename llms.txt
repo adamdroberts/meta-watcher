@@ -1,0 +1,60 @@
+# Meta Watcher
+
+> Cross-platform, person-first desktop video overlay app powered by SAM 3.1. Captures from webcam, RTSP, or local file; keeps a frozen empty-scene inventory of named objects; switches to tracked-person overlays when someone enters; and records one annotated MP4 + JSON sidecar per occupancy event. FastAPI backend with an Astro operator UI, MLX provider on Apple Silicon, and `facebookresearch/sam3` on Linux CUDA.
+
+Repo root is a Python 3.12+ package (`meta_watcher`) plus an Astro source tree under `web/`. The operator UI is served as a committed static bundle from `meta_watcher/web/static/`. The full documentation bundle is at `llms-full.txt`.
+
+## Entry points
+
+- [README.md](README.md): project story, install, run, repo layout.
+- [CHANGELOG.md](CHANGELOG.md): notable changes.
+- [pyproject.toml](pyproject.toml): package metadata, Python/optional extras, `meta-watcher` console script.
+- [config.default.json](config.default.json): canonical config example.
+
+## Documentation
+
+- [docs/README.md](docs/README.md): top-level documentation index.
+- [docs/guides/getting-started.md](docs/guides/getting-started.md): install, configure, run.
+- [docs/guides/operator-ui.md](docs/guides/operator-ui.md): operating the web UI end to end.
+- [docs/guides/frontend.md](docs/guides/frontend.md): Astro build and dev loop.
+- [docs/guides/testing.md](docs/guides/testing.md): what each test module covers.
+- [docs/guides/troubleshooting.md](docs/guides/troubleshooting.md): camera/model/perf issues.
+- [docs/architecture/overview.md](docs/architecture/overview.md): components, threads, frame lifecycle (with Mermaid).
+- [docs/architecture/state-machine.md](docs/architecture/state-machine.md): inventory/person/cooldown transitions.
+- [docs/architecture/recording.md](docs/architecture/recording.md): pre-roll/post-roll, metadata sidecars.
+- [docs/architecture/inference-backends.md](docs/architecture/inference-backends.md): MLX subprocess and CUDA `sam3.perflib` patch.
+- [docs/reference/http-api.md](docs/reference/http-api.md): `/api/*`, `/stream.mjpg`, `/frame.jpg`.
+- [docs/reference/python-api.md](docs/reference/python-api.md): public classes and functions.
+- [docs/reference/configuration.md](docs/reference/configuration.md): every config field and default.
+- [docs/reference/cli.md](docs/reference/cli.md): `meta-watcher` flags.
+- [docs/internals/pipeline.md](docs/internals/pipeline.md): `StreamProcessor` and `StreamRuntime` in detail.
+- [docs/internals/web-state.md](docs/internals/web-state.md): `RuntimeState` threading contract.
+- [docs/internals/inference.md](docs/internals/inference.md): MLX RPC, fp32 patch.
+
+## Agent skills
+
+Repo-local skills live under `.claude/skills/`. Use them when an LLM is operating this project. The index describes each skill and points at the right docs page:
+
+- [.claude/skills/README.md](.claude/skills/README.md): index and routing.
+- [.claude/skills/pipeline-core/SKILL.md](.claude/skills/pipeline-core/SKILL.md): modifying the capture/inference/overlay/recorder pipeline.
+- [.claude/skills/web-surface/SKILL.md](.claude/skills/web-surface/SKILL.md): adding or changing HTTP endpoints and runtime state.
+- [.claude/skills/frontend-astro/SKILL.md](.claude/skills/frontend-astro/SKILL.md): Astro UI changes and rebuilds.
+- [.claude/skills/inference-backends/SKILL.md](.claude/skills/inference-backends/SKILL.md): MLX/CUDA provider changes.
+
+## Source layout
+
+- `meta_watcher/app.py`: `meta-watcher` CLI `main`.
+- `meta_watcher/config.py`: `AppConfig` dataclasses and `load_config`.
+- `meta_watcher/core.py`: `VideoFrame`, `Detection`, `TrackManager`, `StreamStateMachine`, `ClipRecorder`.
+- `meta_watcher/inference.py`: `InferenceProvider` ABC + MLX/CUDA implementations.
+- `meta_watcher/sources.py`: `VideoSource` + `WebcamSource`/`RtspSource`/`FileSource` + `list_webcams`.
+- `meta_watcher/overlay.py`: `render_overlay`.
+- `meta_watcher/pipeline.py`: `StreamProcessor`, `StreamRuntime`.
+- `meta_watcher/web/state.py`: `RuntimeState`.
+- `meta_watcher/web/server.py`: FastAPI `build_app`.
+- `web/src/`: Astro sources for the UI.
+- `tests/`: `unittest` suite.
+
+## Machine bundle
+
+- [llms-full.txt](llms-full.txt): single-file documentation bundle for ingestion.

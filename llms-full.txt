@@ -1,0 +1,1639 @@
+# Meta Watcher — Full Documentation Bundle
+
+This file aggregates the canonical docs for LLM ingestion. It is maintained alongside the browsable docs under `docs/` — if they diverge, `docs/` is authoritative. Order: README, CHANGELOG, getting started, architecture, guides, reference, internals, agent skills index.
+
+---
+
+# README.md
+
+# Meta Watcher
+
+Meta Watcher is a person-first video overlay application for Apple Silicon macOS and NVIDIA Linux. It supports USB webcams, RTSP/IP streams, and local video files, keeps a stable empty-scene inventory of objects, switches to people-only overlays when someone enters the scene, and records one annotated clip per occupancy event.
+
+- **Backend (all platforms):** FastAPI + uvicorn on `http://127.0.0.1:8765`, a two-thread capture/inference pipeline, and an MJPEG stream at `/stream.mjpg`.
+- **Apple Silicon inference:** `mlx-community/sam3.1-bf16` loaded through `mlx-vlm` in a spawned worker process.
+- **Linux CUDA inference:** `facebook/sam3.1` loaded through the official `facebookresearch/sam3` package.
+- **Operator UI:** static Astro bundle shipped inside the Python package at `meta_watcher/web/static/`.
+
+## Documentation
+
+- Browse the full set: [`docs/README.md`](docs/README.md).
+- Getting started: [`docs/guides/getting-started.md`](docs/guides/getting-started.md).
+- Architecture: [`docs/architecture/overview.md`](docs/architecture/overview.md).
+- HTTP API reference: [`docs/reference/http-api.md`](docs/reference/http-api.md).
+- Python API reference: [`docs/reference/python-api.md`](docs/reference/python-api.md).
+- Configuration reference: [`docs/reference/configuration.md`](docs/reference/configuration.md).
+- CLI reference: [`docs/reference/cli.md`](docs/reference/cli.md).
+- Frontend guide: [`docs/guides/frontend.md`](docs/guides/frontend.md).
+- Testing: [`docs/guides/testing.md`](docs/guides/testing.md).
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md).
+- LLM-facing index: [`llms.txt`](llms.txt) and bundle: [`llms-full.txt`](llms-full.txt).
+
+## Install
+
+Base package:
+
+```bash
+python3 -m pip install -e .
+```
+
+Meta Watcher currently targets `numpy>=1.26,<2` so the Linux CUDA path remains compatible with the official `facebookresearch/sam3` package.
+
+Desktop runtime (FastAPI server + OpenCV capture + PyYAML):
+
+```bash
+python3 -m pip install -e ".[desktop]"
+```
+
+Apple Silicon Mac (adds `mlx-vlm`):
+
+```bash
+python3 -m pip install -e ".[desktop,mac]"
+```
+
+Linux with NVIDIA CUDA (adds upstream `facebookresearch/sam3` from `main`, plus `einops`, `pycocotools`, `torch`, `torchvision`):
+
+```bash
+python3 -m pip install -e ".[desktop,linux]"
+```
+
+The Linux extra pulls `facebookresearch/sam3` from its upstream `main` branch so Meta Watcher stays aligned with the latest SAM 3.1 code, but it is not a reproducible pinned install. Linux CUDA inference also expects a CUDA-capable PyTorch environment; if you need PyTorch separately, follow the current CUDA wheel instructions from PyTorch before installing `.[desktop,linux]`.
+
+The `[desktop]` extra expects the prebuilt Astro bundle at `meta_watcher/web/static/index.html` to exist. The bundle is committed to the repo so `pip install -e .` works out of the box. To rebuild it, see "Frontend development" below.
+
+## Model access
+
+- Request gated access to [`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1).
+- On macOS, install the MLX conversion [`mlx-community/sam3.1-bf16`](https://huggingface.co/mlx-community/sam3.1-bf16).
+- Inventory labels come from the `inventory.labels` config field and SAM 3.1 validates them with open-vocabulary text prompts.
+
+## Run
+
+```bash
+meta-watcher --config ./config.default.json
+```
+
+If no config is supplied, the app uses built-in defaults. The web UI is served at `http://127.0.0.1:8765`. Useful flags:
+
+- `--host 0.0.0.0` / `--port 9000` — bind elsewhere. Defaults are `127.0.0.1:8765`.
+- `--open-browser` — auto-open the system browser once uvicorn is listening (off by default).
+
+### Capture resolution
+
+The webcam source defaults to 1280×720 at 30 fps. Higher resolutions make every downstream stage more expensive (inference, mask compositing, H.264 recording, JPEG streaming), so lower resolutions are usually the right tradeoff. Override via config:
+
+```json
+{ "source": { "kind": "webcam", "value": "0", "width": 1920, "height": 1080, "fps": 30 } }
+```
+
+On startup the webcam source logs the resolution the camera actually reported back (some devices silently ignore the request). The web HUD and stderr also emit per-stage timings and effective FPS once per second so you can see which stage is the bottleneck.
+
+To run headless (no GUI session available) just omit `--open-browser` and point your own browser at the bound URL.
+
+## Frontend development
+
+The Astro source lives under `web/`. Rebuild the static bundle (output lands in `meta_watcher/web/static/`) with:
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+For an interactive dev loop, run `npm run dev` (Astro on `:4321`) alongside `meta-watcher` and browse to `http://127.0.0.1:4321`. The Astro dev server proxies `/api`, `/stream.mjpg`, and `/frame.jpg` to the backend at `http://127.0.0.1:8765` (override with `META_WATCHER_BACKEND`).
+
+See [`docs/guides/frontend.md`](docs/guides/frontend.md) for the full frontend workflow.
+
+## Tests
+
+The repository uses stdlib `unittest` for logic tests so they can run without the GUI or model dependencies:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+See [`docs/guides/testing.md`](docs/guides/testing.md) for what each test module covers and how to extend them.
+
+## Repository layout
+
+```
+meta_watcher/        Python package (capture → inference → overlay → recording → web)
+  app.py             meta-watcher CLI entry point
+  config.py          AppConfig dataclasses and load_config
+  core.py            Shared types, TrackManager, StreamStateMachine, ClipRecorder
+  inference.py       InferenceProvider ABC + MLX/CUDA implementations
+  sources.py         VideoSource implementations for webcam, RTSP, file
+  overlay.py         render_overlay: draws masks, bboxes, HUD
+  pipeline.py        StreamProcessor + StreamRuntime (producer/consumer threads)
+  web/
+    server.py        FastAPI app (build_app)
+    state.py         RuntimeState thread-safe container for the runtime + MJPEG buffer
+    static/          Prebuilt Astro bundle (committed)
+web/                 Astro source for the operator UI (build output goes into meta_watcher/web/static/)
+tests/               Stdlib unittest suite (core, pipeline, inference, app/web)
+bin/meta-watcher     Bash launcher (used when running from the repo without install)
+config.default.json  Example config used by docs and manual runs
+```
+
+## License
+
+MIT. See [`pyproject.toml`](pyproject.toml) for package metadata.
+
+---
+
+# CHANGELOG.md
+
+# Changelog
+
+Notable changes to Meta Watcher. Dates are ISO-8601.
+
+## [Unreleased]
+
+### Added
+
+- Documentation set under `docs/` with guides, reference, architecture, and internals pages, plus Mermaid diagrams for component layout, frame lifecycle, state machine, recording, UI start/stop, and MLX subprocess RPC.
+- `llms.txt` LLM-facing index and `llms-full.txt` aggregated bundle at the repo root.
+- Repo-local agent skills under `.claude/skills/` for the core pipeline, HTTP surface, frontend, and inference backends, with an index routing each skill to its docs.
+
+### Changed
+
+- `README.md` now links to the docs set and LLM artifacts.
+
+### Removed
+
+- Dead `--no-browser` CLI flag (the default is already no browser).
+
+---
+
+# docs/README.md
+
+# Meta Watcher documentation
+
+Meta Watcher is a person-first desktop video overlay app powered by SAM 3.1. It captures from a webcam, RTSP stream, or local file; runs text-prompted segmentation on either Apple Silicon (MLX) or NVIDIA CUDA; keeps a stable empty-scene inventory of named objects; switches to tracked-people overlays when someone is present; and records one annotated MP4 plus JSON sidecar per occupancy event.
+
+These docs are organized by the job the reader is trying to do.
+
+## Getting started
+
+- [Getting started](guides/getting-started.md) — install, configure, and run the CLI end to end.
+- [CLI reference](reference/cli.md) — every flag supported by `meta-watcher`.
+- [Configuration reference](reference/configuration.md) — every field of `config.default.json`, its default, and what it does.
+
+## Architecture
+
+- [Architecture overview](architecture/overview.md) — components, runtime threads, and the frame lifecycle.
+- [State machine](architecture/state-machine.md) — inventory / person-present / cooldown transitions and the recording decisions tied to them.
+- [Recording pipeline](architecture/recording.md) — pre-roll buffer, event start/finish, sink lifecycle, and metadata.
+- [Inference backends](architecture/inference-backends.md) — how MLX and CUDA providers are built and where the subprocess boundary lives.
+
+## How-to guides
+
+- [Operate the web UI](guides/operator-ui.md) — controls, status panel, and inventory list.
+- [Frontend development](guides/frontend.md) — build and iterate on the Astro bundle.
+- [Testing](guides/testing.md) — run the suite, and what each module covers.
+- [Troubleshooting](guides/troubleshooting.md) — common failures around cameras, model access, and performance.
+
+## Reference
+
+- [HTTP API reference](reference/http-api.md) — every endpoint exposed by `meta_watcher.web.server.build_app`.
+- [Python API reference](reference/python-api.md) — classes and functions intended to be used from embedding code.
+- [Configuration reference](reference/configuration.md) — config schema and defaults.
+- [CLI reference](reference/cli.md) — `meta-watcher` flags.
+
+## Internals (for maintainers)
+
+- [Pipeline internals](internals/pipeline.md) — `StreamProcessor` and `StreamRuntime` in detail.
+- [Web runtime state](internals/web-state.md) — the threading contract behind `RuntimeState`.
+- [Inference patches and provider lifecycle](internals/inference.md) — the `sam3.perflib` fp32 patch and the MLX subprocess RPC protocol.
+
+## Agent skills
+
+Meta Watcher ships repo-local agent skills so Claude Code and compatible LLM tools can operate the project consistently. Start at the index:
+
+- [Agent skills index](../.claude/skills/README.md).
+
+## Machine-readable bundles
+
+- [`../llms.txt`](../llms.txt) — compact LLM-facing index.
+- [`../llms-full.txt`](../llms-full.txt) — single-file documentation bundle for ingestion.
+
+---
+
+# docs/guides/getting-started.md
+
+# Getting started
+
+This guide walks from a fresh checkout to a running Meta Watcher instance with a custom config.
+
+## 1. Prerequisites
+
+- Python 3.12 or newer (`pyproject.toml` requires `>=3.12`).
+- A supported platform:
+  - Apple Silicon macOS (arm64) with [`mlx-vlm`](https://pypi.org/project/mlx-vlm/) available, or
+  - Linux x86_64 with an NVIDIA GPU and a CUDA-capable PyTorch install.
+- A webcam, RTSP/IP stream, or local video file.
+- Access to the SAM 3.1 model weights:
+  - `facebook/sam3.1` on Hugging Face (gated — request access).
+  - `mlx-community/sam3.1-bf16` for MLX on macOS.
+
+## 2. Install
+
+Pick the extras that match your platform. Both sets layer on top of the `desktop` extra, which installs FastAPI, uvicorn, OpenCV, and PyYAML.
+
+```bash
+# Base package only (no GUI, no inference)
+python3 -m pip install -e .
+
+# Desktop runtime on any platform (adds FastAPI + OpenCV)
+python3 -m pip install -e ".[desktop]"
+
+# Apple Silicon macOS
+python3 -m pip install -e ".[desktop,mac]"
+
+# Linux with NVIDIA CUDA (pulls facebookresearch/sam3 from main)
+python3 -m pip install -e ".[desktop,linux]"
+```
+
+See the [configuration reference](../reference/configuration.md) for how the Linux extra is pinned.
+
+## 3. Run with defaults
+
+```bash
+meta-watcher
+```
+
+This starts uvicorn at `http://127.0.0.1:8765` with the built-in defaults, which mean:
+
+- Webcam source at index `0`, 1280×720 @ 30 fps.
+- MLX provider on macOS, CUDA provider elsewhere.
+- Empty inventory labels (so inventory mode is effectively a no-op until you set some).
+- Recordings written to `./recordings/`.
+
+Open the URL in your browser and use the right-hand control panel to set source, thresholds, and inventory labels, then click **Start**.
+
+## 4. Run with a config file
+
+```bash
+meta-watcher --config ./config.default.json
+```
+
+The shipped `config.default.json` is the canonical example:
+
+```json
+{
+  "source": { "kind": "webcam", "value": "0", "width": 1280, "height": 720, "fps": 30 },
+  "models": { "mac_sam_model_id": "mlx-community/sam3.1-bf16",
+              "linux_sam_model_id": "facebook/sam3.1",
+              "inference_max_side": 960,
+              "inference_interval_ms": 200 },
+  "thresholds": { "person_confidence": 0.3, "inventory_confidence": 0.25,
+                  "overlap_iou": 0.5, "tracking_iou": 0.3, "min_area_ratio": 0.002 },
+  "timings": { "empty_scene_rescan_seconds": 5.0, "person_confirmation_frames": 3,
+               "pre_roll_seconds": 0.5, "post_roll_seconds": 2.0 },
+  "inventory": { "labels": ["chair", "table", "laptop", "book", "cup", "bottle", "plant"],
+                 "auto_rescan": true },
+  "output": { "directory": "recordings" }
+}
+```
+
+YAML with the same top-level keys is also accepted.
+
+## 5. Read the overlay
+
+When the pipeline is running, the video frame carries an in-frame HUD:
+
+- **Mode** — `inventory`, `person_present`, or `cooldown`.
+- **Inventory scan** — `on` while SAM 3.1 is validating inventory labels, `frozen` otherwise.
+- **Recording** — `active` whenever a clip is being written.
+- **HUD timings** — a compact `fps / i:<infer> o:<overlay> r:<recorder>` line (see the [pipeline internals](../internals/pipeline.md)).
+
+The same state is mirrored in the right-hand operator panel in the UI and the `/api/snapshot` HTTP endpoint. See the [operator UI guide](operator-ui.md) and the [HTTP API reference](../reference/http-api.md).
+
+## 6. Inspect recordings
+
+Every confirmed occupancy event becomes two files in the output directory:
+
+- `{source_id}_{UTC timestamp}.mp4` — the annotated clip, including the pre-roll buffer.
+- `{source_id}_{UTC timestamp}.json` — metadata: `clip_path`, `source_id`, `inventory` (labels at event start), `started_at`, `ended_at`, and `person_ids` (track IDs that appeared during the event).
+
+The UI lists completed clip paths under **Completed clips** in the control panel.
+
+## 7. Next steps
+
+- [Operate the web UI](operator-ui.md) — end-to-end walk through the controls.
+- [Architecture overview](../architecture/overview.md) — understand the threading and frame flow before tuning.
+- [Troubleshooting](troubleshooting.md) — for webcam permission issues, model gating errors, or low FPS.
+
+---
+
+# docs/guides/operator-ui.md
+
+# Operating the web UI
+
+The UI is served at `/` by the Python server and is built from `web/src/` with Astro. The JavaScript glue lives in `web/src/scripts/app.ts` and calls the same HTTP endpoints described in [http-api.md](../reference/http-api.md).
+
+## Layout
+
+```mermaid
+graph LR
+    subgraph Browser
+      A[Video panel<br/>VideoPanel.astro]
+      B[Control panel<br/>ControlPanel.astro]
+      A -- img src=/stream.mjpg --> MJPEG
+      B -- fetch /api/* --> API
+    end
+    API[Backend API]
+    MJPEG[Backend MJPEG]
+```
+
+- **Video panel (left).** A single `<img>` pointing at `/stream.mjpg`. On Start, the script appends a cache-busting query string so browsers reconnect cleanly after Stop → Start.
+- **Control panel (right).** Status readout, form controls for source and thresholds, and a list of completed clips.
+
+## Status readouts
+
+| UI element | Source |
+| ---------- | ------ |
+| `Mode` pill | `snapshot.mode` from `/api/snapshot` |
+| `Status` text | `snapshot.status_text` |
+| `Recording` | `snapshot.recording_active` |
+| `Frozen scene inventory` | `snapshot.inventory_items[*].label` (with confidence and sample count) |
+| `Completed clips` | `snapshot.completed_clips` (newline-joined MP4 paths) |
+
+The panel polls `GET /api/snapshot` every 500 ms (`app.ts::pollLoop`). Errors surface as a red banner at the top of the control panel via `snapshot.error`.
+
+## Controls
+
+| Control | Behavior |
+| ------- | -------- |
+| Source kind | `source.kind` in the outgoing config patch. When set to `webcam`, the dropdown is populated by `/api/devices/webcams` and the text field is hidden. |
+| Source value | For `webcam`, the selected dropdown value (integer index). For `rtsp`, the URL. For `file`, the path. |
+| Output directory | `output.directory`; defaults to `recordings` if blank. |
+| Person threshold | `thresholds.person_confidence`. |
+| Inventory threshold | `thresholds.inventory_confidence`. |
+| Inventory labels | `inventory.labels`, split on commas, whitespace-trimmed, empty entries dropped. |
+| Auto rescan | `inventory.auto_rescan`. |
+| Record clips | Sent separately to `POST /api/runtime/recording` with `{enabled}` before Start. |
+| Start | `PUT /api/config` with the collected patch, then `POST /api/runtime/recording`, then `POST /api/runtime/start`. |
+| Stop | `POST /api/runtime/stop`. |
+| Manual rescan | `POST /api/runtime/rescan`. |
+| ↻ next to the webcam dropdown | Calls `loadWebcams(null)` to re-run the enumeration. |
+
+## Start/stop cycle
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant API as Backend API
+    participant State as RuntimeState
+    participant Runtime as StreamRuntime
+    UI->>API: PUT /api/config (source, thresholds, labels, output)
+    UI->>API: POST /api/runtime/recording {enabled}
+    UI->>API: POST /api/runtime/start
+    API->>State: state.start(patch=None)
+    State->>Runtime: StreamRuntime(...).start()
+    Runtime-->>State: on_snapshot (every processed frame)
+    State-->>API: /api/snapshot JSON
+    API-->>UI: polled 2x/s
+    UI->>API: POST /api/runtime/stop
+    API->>State: state.stop()
+    State->>Runtime: runtime.stop()
+```
+
+## MJPEG reconnect
+
+`app.ts::reloadStream` swaps the `<img src>` to `/stream.mjpg?t={Date.now()}` whenever the runtime is restarted so the browser does not reuse a broken stream from the previous run. The backend's MJPEG generator handles its own reconnect — it always resumes from the latest available JPEG.
+
+## Production vs. dev UI
+
+The `meta-watcher` CLI serves the committed `meta_watcher/web/static/index.html` bundle. For an interactive dev loop, see the [frontend guide](frontend.md). The dev server (`npm run dev` in `web/`) runs on `:4321` and proxies `/api`, `/stream.mjpg`, and `/frame.jpg` to the Python backend.
+
+---
+
+# docs/guides/frontend.md
+
+# Frontend development
+
+The operator UI is an Astro 5 static site. Source lives in `web/`; the build output is committed to `meta_watcher/web/static/` so `pip install -e .` produces a working UI without requiring a Node toolchain.
+
+## Project layout
+
+```
+web/
+├── astro.config.mjs     Output target + dev-server proxy
+├── package.json         pnpm / npm scripts
+├── tsconfig.json
+└── src/
+    ├── pages/index.astro           Root page, loads VideoPanel and ControlPanel, imports app.ts
+    ├── components/
+    │   ├── VideoPanel.astro        <img src="/stream.mjpg">
+    │   └── ControlPanel.astro      Status rows, form controls, inventory/clip lists
+    ├── scripts/app.ts              All client logic: fetch config, start/stop, poll snapshot
+    └── styles/global.css           Dark-theme styles, grid layout, status pill colors
+```
+
+## Install
+
+From the `web/` directory:
+
+```bash
+cd web
+npm install
+```
+
+A `pnpm-lock.yaml` is checked in, so `pnpm install` also works and is noticeably faster for cold installs.
+
+## Build
+
+```bash
+cd web
+npm run build
+```
+
+Astro writes the build to `outDir: "../meta_watcher/web/static"`. The Python server mounts that directory via `StaticFiles(html=True)`, so after a build `meta-watcher` immediately serves the new bundle.
+
+Commit the resulting `meta_watcher/web/static/` diff together with the `web/src/` change. The repo is set up to ship the compiled bundle so the Python install does not need Node.
+
+## Dev loop
+
+```bash
+# Terminal 1: backend
+meta-watcher
+
+# Terminal 2: frontend with HMR
+cd web
+npm run dev
+# Visit http://127.0.0.1:4321
+```
+
+`astro.config.mjs` wires Vite's proxy so `/api`, `/stream.mjpg`, and `/frame.jpg` go to `http://127.0.0.1:8765`. Point elsewhere with the `META_WATCHER_BACKEND` env var before starting `npm run dev`:
+
+```bash
+META_WATCHER_BACKEND=http://192.168.1.100:8765 npm run dev
+```
+
+## Preview
+
+`npm run preview` serves the static build locally but does *not* proxy to a backend, so `/api/*` calls will 404 unless you run the Python server on the same origin (by binding to `127.0.0.1:4321` with `--port 4321`, for example).
+
+## Styling conventions
+
+- All colors and fonts are declared as CSS custom properties at the top of `global.css` (`--bg`, `--text`, `--accent`, etc.). Keep new styles consistent with those variables so dark mode stays coherent.
+- Status values (`idle`, `inventory`, `person_present`, `cooldown`) become `data-mode` attributes on the `#status-mode` pill. Color rules key off those attributes in `global.css`.
+
+## API contract
+
+The TypeScript side assumes the shapes documented in [`http-api.md`](../reference/http-api.md). The `SnapshotPayload` type in `app.ts` is intentionally narrow — it lists just the fields the UI actually reads. If you add a new field to `/api/snapshot`, extend that type before relying on it in the UI.
+
+## Accessibility notes
+
+- The control panel uses a form (`<form id="controls">`) so Enter submits and Start is the default.
+- `aria-live="polite"` is set on the inventory and clip lists so screen readers announce updates without overwhelming.
+- The video `<img>` has an `alt` of `"Meta Watcher video stream"`; reconnect logic preserves the element so focus survives restarts.
+
+## Shipping changes
+
+1. Edit the Astro / TS source.
+2. Run `npm run build` in `web/`.
+3. Commit both the `web/src/*` change and the updated `meta_watcher/web/static/*` files.
+4. Run `python3 -m unittest discover -s tests` to confirm the Python `test_app.py::WebServerTests` still pass (they exercise the endpoints your UI talks to).
+
+---
+
+# docs/guides/testing.md
+
+# Testing
+
+The repository uses the stdlib `unittest` runner so tests run without pytest installed. Model and camera dependencies are stubbed with fakes so the suite works on any machine.
+
+## Run
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Optional, if you installed the `[dev]` extra:
+
+```bash
+pytest tests
+```
+
+The `[dev]` extra only adds `pytest`; there are no pytest-specific fixtures in use, so both runners exercise the same tests.
+
+## Modules
+
+### `tests/test_core.py`
+
+Covers the non-ML building blocks:
+
+- `CoreTests.test_normalize_label` — label normalization rules (stemming, article stripping).
+- `CoreTests.test_track_manager_reuses_ids` — `TrackManager` keeps stable IDs across near-overlapping boxes.
+- `CoreTests.test_state_machine_confirm_cooldown_and_manual_rescan` — full `inventory → person_present → cooldown → inventory` cycle plus the manual-rescan latch.
+- `CoreTests.test_clip_recorder_uses_preroll_and_postroll` — pre-roll flush, post-roll delay, and metadata sidecar contents, using an in-memory sink.
+- `CoreTests.test_webcam_source_only_probes_requested_index` — when the user selects a specific webcam index, the source trusts it and does not probe other devices.
+- `CoreTests.test_webcam_source_auto_uses_enumeration` — when the source value is `auto`, the Linux path uses `_list_linux_webcams` to pick candidates.
+
+### `tests/test_pipeline.py`
+
+Exercises `StreamProcessor` end-to-end with a `FakeProvider` and the in-memory sink:
+
+- `PipelineTests.test_configured_labels_drive_inventory_detection` — inventory labels come from config and the provider is asked for them during inventory mode; the event flow records a single clip.
+- `PipelineTests.test_empty_label_config_skips_inventory_detection` — empty label list never triggers a provider call for inventory prompts.
+- `PipelineTests.test_update_labels_takes_effect_immediately` — `StreamProcessor.update_labels` affects the very next inventory pass.
+- `PipelineTests.test_inference_receives_downscaled_frame_and_bboxes_upscale` — `inference_max_side` downscales the frame fed to the provider and detections come back in original-resolution coordinates.
+- `PipelineTests.test_inference_rate_limited_by_interval` — `inference_interval_ms` gates how often the provider is called per second.
+- `PipelineTests.test_snapshot_carries_stage_timings` — every snapshot has non-negative `inference`/`overlay`/`recorder`/`total` timings and an `effective_fps` that becomes positive after at least two samples.
+
+### `tests/test_inference.py`
+
+Validates the Linux CUDA provider's install-time and warmup contracts without actually loading SAM 3.1:
+
+- `LinuxInferenceInstallTests.test_base_dependencies_keep_numpy_in_sam3_compatible_range` — guards against someone bumping numpy to 2.x.
+- `LinuxInferenceInstallTests.test_linux_extra_installs_sam3_from_main` — guards the Linux extra declaration.
+- `LinuxInferenceInstallTests.test_cuda_provider_reports_linux_extra_when_sam3_is_missing` — the import-failure error message must tell the operator to reinstall.
+- `LinuxInferenceInstallTests.test_cuda_provider_forces_float32_on_warmup` — floating tensors are cast to fp32, complex tensors keep their dtype, and the model is moved to `train(False)`.
+- `LinuxInferenceInstallTests.test_move_inputs_to_model_casts_only_floating_tensors` — input-movement helper respects `is_floating_point()`.
+
+### `tests/test_app.py`
+
+Tests the web layer with fakes:
+
+- `RuntimeStateTests` — initial snapshot shape, config patch merging, snapshot-callback JPEG encoding, and start/stop against a scripted source + fake provider.
+- `WebServerTests` — FastAPI endpoints via `fastapi.testclient.TestClient`. Skipped if `fastapi` is not installed. Covers `GET /api/config`, `PUT /api/config`, `GET /api/snapshot`, `POST /api/runtime/rescan`, and `GET /frame.jpg`.
+
+## Writing new tests
+
+- Do not add tests that require a real camera, GPU, or gated Hugging Face access. Use `FakeProvider` / `MemorySink` / `_ScriptedSource` patterns that already exist.
+- Keep tests deterministic. Pass explicit timestamps (`make_frame(i, timestamp=...)`) rather than relying on wall time.
+- When testing new recorder behavior, use `ClipRecorder(..., sink_factory=MemorySinkFactory())` so you get hold of the in-memory sink list for assertions.
+- For new HTTP endpoints, extend `WebServerTests` rather than spinning up uvicorn. Use `_build_client()` to get a `(TestClient, RuntimeState)` tuple with fakes already installed.
+
+---
+
+# docs/guides/troubleshooting.md
+
+# Troubleshooting
+
+## Cameras
+
+### No webcam is detected on the dropdown
+
+- Click the ↻ button next to the webcam select to re-call `/api/devices/webcams`.
+- On Linux, confirm `/dev/video*` entries exist and that your user is in the `video` group. `list_webcams()` filters out metadata-only devices by reading `/sys/class/video4linux/videoN/device/capabilities`; check the bitfield if your device is missing.
+- On macOS, Camera permission is enforced per-binary. If the enumeration returns nothing, the Python launcher may not have Camera access. Reset it under *System Settings → Privacy & Security → Camera* (toggle off and back on for Python). The backend also emits a hint message on failure.
+
+### "Failed to open any webcam device" on macOS
+
+`WebcamSource` raises this when every candidate index fails `isOpened()` or the initial `.read()` retries exhaust. Causes seen in practice:
+
+- Camera is in use by another app.
+- macOS permission prompt was dismissed; reset it as above.
+- The index provided to `source.value` refers to a virtual or metadata-only device.
+
+### Webcam opens but frames look wrong or too low-res
+
+The camera may silently ignore the requested `width`/`height`/`fps`. Meta Watcher logs actual values at startup:
+
+```
+[meta-watcher] webcam index=0 requested=1920x1080@30 actual=1280x720@30.0
+```
+
+If `actual` is smaller than `requested`, drop the request to match the device's supported modes.
+
+## Inference / model access
+
+### `mlx-vlm is required for Apple Silicon inference.`
+
+Raised by `MlxSam31Provider.warmup`. Install the Mac extra:
+
+```bash
+python3 -m pip install -e ".[desktop,mac]"
+```
+
+### `Linux CUDA inference requires the official facebookresearch/sam3 package.`
+
+Raised by `CudaSam31Provider.warmup` when `import sam3` fails. Install the Linux extra:
+
+```bash
+python3 -m pip install -e ".[desktop,linux]"
+```
+
+This pulls from `facebookresearch/sam3` main, so a clean `pip install` is required after the upstream branch updates if you want the latest code.
+
+### `mat1 and mat2 must have the same dtype: float vs bfloat16`
+
+This is the fused `addmm_act` mismatch described in [inference backends](../architecture/inference-backends.md). If you see it, the `_patch_sam3_fused_addmm_to_fp32` patch did not run before the model's first forward. Check that `CudaSam31Provider.warmup` actually ran on your call path — the patch lives inside warmup — and that no other code path is loading `sam3` before the provider does.
+
+### Hugging Face 403 / gated model
+
+`facebook/sam3.1` requires model access approval. Request it from the model page, then authenticate with `huggingface-cli login` or set `HF_TOKEN` in your environment before starting the server.
+
+## Performance
+
+### FPS is low
+
+Read the per-second log line Meta Watcher prints to stderr:
+
+```
+[meta-watcher] fps=17.5 infer=58.0ms overlay=6.0ms recorder=1.0ms total=64.9ms mode=inventory frame=1280x720
+```
+
+- If `infer` is the dominant stage, drop the capture resolution or lower `models.inference_max_side`, or raise `models.inference_interval_ms`.
+- If `overlay` dominates, the frame is probably very large; the overlay does PIL compositing at full resolution.
+- If `recorder` dominates, the OpenCV `VideoWriter` is bottlenecked on disk or encoding. Switch the output to a faster disk.
+- If FPS is lower than your capture frame rate but each stage is cheap, your consumer thread is CPU-starved. The producer will drop frames — the MJPEG stream and the recording still get every camera frame.
+
+### MJPEG is smooth but annotations lag
+
+This is by design. The producer pushes camera frames into the MJPEG buffer and the recorder at camera rate. The consumer is rate-limited by `inference_interval_ms` and inference cost. Overlays only update when the consumer finishes a frame. If you need annotations to lead, drop the inference interval or downscale more aggressively.
+
+## UI / server
+
+### "The web UI bundle is missing"
+
+Shown when `meta_watcher/web/static/index.html` does not exist. Rebuild the bundle:
+
+```bash
+cd web && npm install && npm run build
+```
+
+### Browser did not open automatically
+
+The CLI opens a browser only when `--open-browser` is passed. Without that flag, point your browser at the bound URL yourself. This is the safer default for SSH / headless use.
+
+### Errors surface in the UI banner
+
+`/api/snapshot` returns the last error captured by `RuntimeState._on_error` in the `error` field. Producer errors (camera read failures) and consumer errors (provider crashes) both route through this field. The red banner in the control panel shows the latest message and clears once a subsequent successful frame arrives.
+
+---
+
+# docs/architecture/overview.md
+
+# Architecture overview
+
+Meta Watcher is a local service with three cooperating layers:
+
+1. **Capture and inference pipeline** (`meta_watcher/pipeline.py`, `meta_watcher/core.py`, `meta_watcher/inference.py`, `meta_watcher/sources.py`, `meta_watcher/overlay.py`).
+2. **Web runtime state and server** (`meta_watcher/web/state.py`, `meta_watcher/web/server.py`).
+3. **Astro operator UI** (`web/src/`) that calls the HTTP API and displays the MJPEG stream.
+
+The whole thing is started from `meta_watcher/app.py` via the `meta-watcher` console script defined in `pyproject.toml`.
+
+## Component diagram
+
+```mermaid
+graph LR
+    subgraph Browser
+      UI[Astro operator UI<br/>(/stream.mjpg + fetch /api/*)]
+    end
+    subgraph Backend
+      CLI[meta_watcher.app.main]
+      Server[FastAPI app<br/>meta_watcher.web.server]
+      State[RuntimeState<br/>meta_watcher.web.state]
+      Runtime[StreamRuntime<br/>meta_watcher.pipeline]
+      Processor[StreamProcessor<br/>meta_watcher.pipeline]
+      Source[VideoSource<br/>meta_watcher.sources]
+      Provider[InferenceProvider<br/>meta_watcher.inference]
+      Recorder[ClipRecorder<br/>meta_watcher.core]
+      Overlay[render_overlay<br/>meta_watcher.overlay]
+    end
+    UI -- HTTP --> Server
+    Server --> State
+    State --> Runtime
+    Runtime --> Source
+    Runtime --> Processor
+    Processor --> Provider
+    Processor --> Overlay
+    Processor --> Recorder
+    Runtime -. on_snapshot .-> State
+    State -. MJPEG .-> Server
+    CLI --> State
+    CLI --> Server
+```
+
+## Frame lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Camera as VideoSource
+    participant Producer as StreamRuntime<br/>producer thread
+    participant Queue as queue.Queue(maxsize=2)
+    participant Consumer as StreamRuntime<br/>consumer thread
+    participant Processor as StreamProcessor
+    participant Provider as InferenceProvider
+    participant Recorder as ClipRecorder
+    participant State as RuntimeState
+    participant Browser
+
+    Camera->>Producer: read() -> VideoFrame
+    Producer->>State: on_raw_frame (before pipeline is live)
+    Producer->>Recorder: push_frame(frame) (pre-roll + live event write)
+    Producer->>Queue: put_latest(frame)
+    Consumer->>Queue: get(timeout=0.2)
+    Consumer->>Processor: process_frame(frame)
+    Processor->>Provider: detect_text_prompts / track_next<br/>(rate-limited by inference_interval_ms)
+    Processor->>Recorder: start_event / finish_event<br/>(writes sit on the producer thread)
+    Processor->>State: PipelineSnapshot(overlay, people, inventory, timings, ...)
+    State->>Browser: encoded JPEG over /stream.mjpg + JSON via /api/snapshot
+```
+
+### Two-thread design
+
+`StreamRuntime` spawns:
+
+- **Producer** (`meta-watcher-source`) — calls `VideoSource.read()` at camera rate, pushes each raw frame into `ClipRecorder.push_frame` (so the recording tap sees every frame, not the rate-limited inference output), and drops the frame into a 2-slot queue. When the queue is full it evicts the oldest frame and keeps the newest.
+- **Consumer** (`meta-watcher-pipeline`) — pulls the latest queued frame, runs `StreamProcessor.process_frame`, emits a `PipelineSnapshot` to the `on_snapshot` callback. Model warmup happens once here on the first loop.
+
+This split keeps inference latency off the recording and MJPEG paths: if inference is slow, the MJPEG stream and the clip file advance at camera speed; only the annotation lags.
+
+## Request surface
+
+| Consumer        | Path                      | Purpose                                        |
+| --------------- | ------------------------- | ---------------------------------------------- |
+| Operator UI     | `GET /`                   | Static Astro bundle from `meta_watcher/web/static` |
+| Operator UI     | `GET /stream.mjpg`        | Multipart MJPEG video stream                    |
+| Operator UI     | `GET /frame.jpg`          | Latest single JPEG (or placeholder)             |
+| Operator UI     | `GET /api/snapshot`       | Current pipeline state, inventory, clips        |
+| Operator UI     | `GET/PUT /api/config`     | Read/merge the running `AppConfig`              |
+| Operator UI     | `GET /api/devices/webcams`| Enumerated webcams (Linux V4L2 / macOS SP)      |
+| Operator UI     | `POST /api/runtime/start` | Start the pipeline (optionally with a patch)    |
+| Operator UI     | `POST /api/runtime/stop`  | Stop the pipeline                               |
+| Operator UI     | `POST /api/runtime/rescan`| Manually rescan inventory                       |
+| Operator UI     | `POST /api/runtime/recording` | Toggle clip recording on/off                |
+
+See the [HTTP API reference](../reference/http-api.md) for exact payloads.
+
+## Modules
+
+| Module                     | Responsibility |
+| -------------------------- | -------------- |
+| `meta_watcher/app.py`      | CLI entry, argparse, uvicorn launch |
+| `meta_watcher/config.py`   | `AppConfig` dataclasses, JSON/YAML loading |
+| `meta_watcher/sources.py`  | Webcam/RTSP/File sources + webcam enumeration |
+| `meta_watcher/inference.py`| MLX (macOS) + CUDA (Linux) SAM 3.1 providers; MLX runs in a spawned subprocess |
+| `meta_watcher/core.py`     | `VideoFrame`, `Detection`, `TrackManager`, `StreamStateMachine`, `ClipRecorder`, `render_overlay` helpers |
+| `meta_watcher/overlay.py`  | PIL-based overlay renderer with in-frame HUD |
+| `meta_watcher/pipeline.py` | `StreamProcessor`, `StreamRuntime`, downscaling + rate-limiting |
+| `meta_watcher/web/state.py`| Thread-safe runtime container, MJPEG buffer, config merging |
+| `meta_watcher/web/server.py`| FastAPI `build_app` wiring endpoints to `RuntimeState` |
+| `meta_watcher/web/static/` | Committed Astro build output (index.html + assets) |
+
+## Where to go next
+
+- [State machine](state-machine.md) for mode transitions.
+- [Recording pipeline](recording.md) for pre-roll / post-roll mechanics.
+- [Inference backends](inference-backends.md) for the MLX subprocess boundary and the CUDA `sam3.perflib` patch.
+- [Pipeline internals](../internals/pipeline.md) for consumer/producer details.
+
+---
+
+# docs/architecture/state-machine.md
+
+# State machine
+
+The pipeline decides what to render and when to record using `meta_watcher.core.StreamStateMachine`. It has three modes: `inventory`, `person_present`, and `cooldown`. Transitions are driven by per-frame `observe(timestamp, people_present, auto_rescan_enabled=...)` calls from `StreamProcessor.process_frame`.
+
+## Transition diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> inventory
+    inventory --> inventory: manual rescan while empty<br/>(inventory_reset=true)
+    inventory --> person_present: people_present for<br/>person_confirmation_frames
+    person_present --> cooldown: people_present == false
+    cooldown --> person_present: people_present == true
+    cooldown --> inventory: empty for<br/>empty_scene_rescan_seconds<br/>or manual rescan
+```
+
+The mode that comes out of `observe` determines:
+
+- which inference calls the processor issues next frame,
+- whether the overlay shows the inventory list or the tracked people,
+- and whether the recorder should start, write, or finish an event.
+
+## Timings and thresholds
+
+All of these come from the `timings` and `thresholds` blocks in the config (see [configuration reference](../reference/configuration.md)).
+
+- **`person_confirmation_frames`** — number of consecutive "people present" frames required before switching from `inventory` to `person_present`. Filters out flicker detections.
+- **`empty_scene_rescan_seconds`** — dwell time after the last person leaves before the machine returns to `inventory` mode and (if `auto_rescan` is enabled) asks the provider to re-validate inventory labels.
+- **`person_confidence`** — minimum provider confidence required to count a detection as a person. Applied in `StreamProcessor._normalize_people`.
+- **`inventory_confidence`** — minimum provider confidence required for an inventory label to be kept and drawn.
+- **`tracking_iou`** and **`min_area_ratio`** — drive `TrackManager` (see below).
+- **`overlap_iou`** — merges co-located duplicate person detections before tracking.
+
+## People tracking
+
+`meta_watcher.core.TrackManager` maintains exponentially-smoothed bounding boxes per person:
+
+- A new detection matches an existing track when the labels are equal and IoU ≥ `tracking_iou`.
+- Matched tracks update bbox and confidence with `smoothing=0.35` (defined in the class).
+- Tracks that go unmatched for more than `max_missed_frames` (default 12) expire.
+- Track IDs look like `person-1`, `person-2`, and are stable across matched frames, so they identify the same person through an occupancy event.
+
+Track IDs flow into the recorded event metadata as `person_ids`.
+
+## Manual rescan
+
+The operator panel's **Manual rescan** button (or a `POST /api/runtime/rescan`) calls `StreamStateMachine.request_manual_rescan()`. The request is latched and applied at the next transition point:
+
+- If currently in `inventory` with no people present → immediately triggers an `inventory_reset` so SAM 3.1 re-scans the configured labels.
+- If currently in `cooldown` with no people present → ends the cooldown now (even before `empty_scene_rescan_seconds` elapses), returns to `inventory`, and resets.
+- If currently in `person_present` → the request is stored and applied once the scene goes empty.
+
+## Auto rescan
+
+`inventory.auto_rescan` controls whether the transition back to `inventory` after an event automatically triggers an `inventory_reset`. When `false`, the pipeline returns to `inventory` mode but does not re-run the configured-label detection pass; the inventory display stays whatever it was before the event started. A manual rescan still forces a refresh.
+
+## Inventory labels
+
+Inventory labels are taken directly from `inventory.labels` in the config. `StreamProcessor._inventory_items_from_labels` normalizes and deduplicates them at construction time and whenever `StreamProcessor.update_labels` is called (used when a config patch changes the label list). Empty label lists short-circuit the inventory detection pass — `FakeProvider.detect_text_prompts` is never asked for an empty prompt list — so inventory mode can legitimately be a no-op.
+
+---
+
+# docs/architecture/recording.md
+
+# Recording pipeline
+
+Meta Watcher records one annotated MP4 per occupancy event, plus a JSON sidecar. Recording is implemented by `meta_watcher.core.ClipRecorder` and wired into the main loop by `StreamProcessor` (decision side) and `StreamRuntime` (producer side).
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant Camera
+    participant Producer as StreamRuntime producer
+    participant Recorder as ClipRecorder
+    participant Buffer as ring buffer (pre-roll)
+    participant Sink as OpenCvClipSink (MP4)
+    participant Processor as StreamProcessor
+    Camera->>Producer: VideoFrame
+    Producer->>Recorder: push_frame(frame)
+    Recorder->>Buffer: append + prune older than pre_roll_seconds
+    Note over Processor: process_frame observes mode
+    Processor->>Recorder: start_event(frame, inventory)<br/>(on event_started)
+    Recorder->>Sink: flush buffer, start writing
+    Producer->>Recorder: push_frame (continues at camera rate)
+    Recorder->>Sink: write(payload)
+    Processor->>Recorder: finish_event(t, person_ids)<br/>(on event_finished)
+    Recorder->>Sink: mark end_requested_at = t + post_roll_seconds
+    Producer->>Recorder: push_frame (past end_requested_at)
+    Recorder->>Sink: close()
+    Recorder->>Processor: drain_completed() -> [EventArtifact]
+```
+
+## Key behaviors
+
+- **Thread ownership.** `push_frame` is called on the producer thread; `start_event`, `finish_event`, `add_person_ids`, and `drain_completed` are called on the consumer thread. The recorder guards all state with a reentrant `threading.RLock`.
+- **Pre-roll.** The recorder keeps a deque of recent `_BufferedFrame` entries and prunes anything older than `pre_roll_seconds`. When `start_event` fires, the buffer is flushed into the sink *before* the live event frames start streaming. `config.default.json` sets this at 0.5 seconds; the dataclass default (`TimingConfig.pre_roll_seconds`) is 3.0 seconds.
+- **Post-roll.** `finish_event(t, person_ids)` does not close the sink immediately; it sets `end_requested_at = t + post_roll_seconds`. Frames continue to be written until the producer sees a frame timestamp at or past that deadline, which guarantees that the actual camera pacing, not the inference pacing, controls the post-roll length.
+- **Clip FPS.** `_estimate_buffer_fps` uses the pre-roll buffer to estimate real fps; if fewer than two frames are buffered it falls back to the frame's reported `fps` or 12.0.
+- **Sink factory.** Defaults to `OpenCvClipSink`, which writes `mp4v`-encoded RGB → BGR frames through `cv2.VideoWriter`. Tests use a `MemorySink` for determinism. A custom sink just needs `write(np.ndarray)` and `close()`.
+- **Source ID naming.** Clip paths are `{frame.source_id}_{UTC-YYYYMMDDTHHMMSSZ}.mp4`. The sidecar uses the same stem with `.json`.
+
+## Metadata shape
+
+Each event produces a JSON sidecar and an in-memory `EventArtifact`:
+
+```json
+{
+  "clip_path": "/abs/path/to/recordings/webcam_20260418T003658Z.mp4",
+  "source_id": "webcam",
+  "inventory": ["chair", "laptop", "bottle"],
+  "started_at": 1712000000.123,
+  "ended_at": 1712000012.987,
+  "person_ids": ["person-3", "person-4"]
+}
+```
+
+- `inventory` captures the labels configured at event start (not a snapshot of what SAM 3.1 actually detected).
+- `started_at` / `ended_at` are whatever clock the source reports (monotonic for live sources, media position for file sources).
+- `person_ids` are the `TrackManager`-assigned track IDs that appeared during the event, drained from `StreamProcessor._event_person_ids`.
+
+## `EventArtifact`
+
+`meta_watcher.core.EventArtifact` exposes `clip_path`, `metadata_path`, `started_at`, `ended_at`, and `person_ids`. `StreamProcessor.process_frame` drains these through `ClipRecorder.drain_completed()` and surfaces the clip paths on `PipelineSnapshot.completed_clips`. `RuntimeState` appends them to a persistent list returned by `/api/snapshot` as `completed_clips`.
+
+## Disabling recording at runtime
+
+Set `state.set_recording_enabled(False)` (via `POST /api/runtime/recording` with `{ "enabled": false }`). The producer thread skips `push_frame` when disabled, and `StreamProcessor` stops calling `start_event` / `finish_event`. Existing open events are not forcibly closed; flipping recording off mid-event simply stops new frames being written.
+
+---
+
+# docs/architecture/inference-backends.md
+
+# Inference backends
+
+`meta_watcher.inference.build_provider(models)` picks the right SAM 3.1 backend for the current platform:
+
+```python
+if sys.platform == "darwin" and machine in {"arm64", "aarch64"}:
+    return MlxSubprocessSam31Provider(models.mac_sam_model_id)
+return CudaSam31Provider(models.linux_sam_model_id)
+```
+
+All providers implement the same `InferenceProvider` ABC:
+
+```python
+class InferenceProvider(ABC):
+    def warmup(self) -> None: ...
+    def detect_text_prompts(self, frame, prompts) -> list[Detection]: ...
+    def start_tracking(self, frame, prompts) -> list[Detection]: ...
+    def track_next(self, frame) -> list[Detection]: ...
+    def shutdown(self) -> None: ...
+```
+
+`StreamProcessor` calls `detect_text_prompts` for inventory labels and `track_next` once an occupancy event is live. `start_tracking` is called on the first `event_started` frame so providers can reset internal tracking state. `warmup` is invoked once per provider on the consumer thread before the first real frame is pulled.
+
+## Apple Silicon: MLX subprocess provider
+
+`MlxSubprocessSam31Provider` is the default on macOS arm64. It spawns a `multiprocessing` worker (`spawn` context) and marshals method calls over two queues:
+
+```mermaid
+sequenceDiagram
+    participant Parent as Main process
+    participant ReqQ as request Queue
+    participant Resp as response Queue
+    participant Worker as _mlx_worker_main
+    participant Mlx as MlxSam31Provider
+
+    Parent->>ReqQ: {method: "warmup"}
+    Worker->>ReqQ: get()
+    Worker->>Mlx: warmup()
+    Mlx-->>Worker: ok
+    Worker->>Resp: {ok: true}
+    Parent->>Resp: get() (with timeout)
+```
+
+### Why a subprocess
+
+`mlx-vlm` imports Metal/MLX modules that are not safe to share with the rest of the Python runtime on some Mac configurations. Isolating them in a dedicated process keeps the main process free of Metal state and lets us restart the provider independently when something goes wrong.
+
+### Serialization
+
+Frames are sent as a dict of the numpy image plus plain scalars via `_serialize_frame`, and detections come back as plain dicts with `label`, `confidence`, `bbox`, `mask` (optional), `track_id`, `metadata` via `_serialize_detections`. Masks and numpy arrays are converted with `np.asarray` to avoid sharing torch/mlx tensors across process boundaries.
+
+### Timeouts and restart
+
+`timeout_seconds` (default 120s) guards every RPC call. If the worker process exits while a call is in flight, the provider raises `RuntimeError("The MLX worker process exited unexpectedly.")`. `shutdown` sends a `shutdown` message and joins the process with a 5-second grace period before terminating.
+
+### In-process MLX provider
+
+`MlxSam31Provider` is the underlying in-process implementation. It loads `mlx-community/sam3.1-bf16` via `mlx_vlm.utils.load_model` + `Sam3Predictor`. Detection uses `predict_multi` when available, falling back to per-prompt `predict` calls. `_synchronize_mlx` flushes the MLX command queue after each call to make timings meaningful. Tests in `tests/test_inference.py` do not exercise this path (it requires MLX); the subprocess wrapper is exercised indirectly through the fake-provider tests in `tests/test_app.py` and `tests/test_pipeline.py`.
+
+## Linux CUDA provider
+
+`CudaSam31Provider` loads `facebook/sam3.1` using `sam3.model_builder.build_sam3_image_model` and wraps it with `sam3.model.sam3_image_processor.Sam3Processor`. The warmup path does several platform-specific things that need to stay in sync with upstream `facebookresearch/sam3`:
+
+1. **Import-guarded error.** If `sam3` is not installed, warmup raises a `RuntimeError` that tells the operator to reinstall with `.[desktop,linux]`. This message is asserted by `tests/test_inference.py::LinuxInferenceInstallTests.test_cuda_provider_reports_linux_extra_when_sam3_is_missing`.
+2. **`sam3.perflib` fp32 patch.** Upstream ships a fused `addmm_act` kernel that hard-casts `mat1`, `mat2`, and `bias` to `bfloat16`. When the rest of the graph is kept in `fp32`, the next Linear layer raises `mat1 and mat2 must have the same dtype: float vs bfloat16`. `_patch_sam3_fused_addmm_to_fp32()` replaces `sam3.perflib.fused.addmm_act` *and* the symbol already bound into `sam3.model.vitdet` with an fp32-safe linear + activation. The patch is idempotent.
+3. **Single-dtype forward.** After building the model, `CudaSam31Provider.warmup` runs a `_cast` closure through `model._apply`. Floating-point tensors become `torch.float32` on the selected device; complex-valued tensors (rotary embeddings) keep their dtype and just move device. `model.train(False)` switches to inference mode. This is asserted by `tests/test_inference.py::LinuxInferenceInstallTests.test_cuda_provider_forces_float32_on_warmup`.
+4. **Autocast inference.** Each call to `detect_text_prompts` runs inside `torch.inference_mode()` + `torch.autocast(device_type=..., enabled=True)`. With the fp32 weights this lets PyTorch pick the most efficient per-op dtype without breaking the fused-op replacement.
+
+### Text prompts and tracking
+
+Both providers return a list of `Detection` per call. `start_tracking` stores the prompt list so `track_next` can re-issue the same text prompts on future frames. The current providers do not exploit any special SAM 3.1 tracking memory — each "track" call is a fresh detection pass constrained to the person prompts. The `TrackManager` in `meta_watcher.core` is what assigns stable IDs across frames.
+
+## Helpers
+
+- `_move_inputs_to_model(inputs, model)` — generic utility that casts floating tensors to the model's dtype and moves all tensors to the model's device. Used in tests and potential future providers.
+- `_to_numpy`, `_coerce_mask`, `_detections_from_output_dict`, `_detections_from_generic_result` — shape normalizers for the two slightly different SAM 3.1 output conventions (dict vs. object with attributes).
+
+## Related docs
+
+- [Pipeline internals](../internals/pipeline.md) — how rate limiting and frame downscaling interact with `detect_text_prompts` vs `track_next`.
+- [Inference internals](../internals/inference.md) — the subprocess RPC protocol and the fp32 patch in more depth.
+
+---
+
+# docs/reference/configuration.md
+
+# Configuration reference
+
+All config fields map to dataclasses in `meta_watcher/config.py`. `load_config(path)` reads JSON or YAML (selected by extension), merges top-level objects onto the dataclass defaults, and returns an `AppConfig`. Missing keys fall back to defaults; unknown keys are silently ignored.
+
+`config.default.json` is the canonical example; tests use `default_config()` directly.
+
+## Top-level shape
+
+```json
+{
+  "source":     { ... SourceConfig ... },
+  "models":     { ... ModelConfig ... },
+  "thresholds": { ... ThresholdConfig ... },
+  "timings":    { ... TimingConfig ... },
+  "inventory":  { ... InventoryConfig ... },
+  "output":     { ... OutputConfig ... }
+}
+```
+
+## `source` (`SourceConfig`)
+
+Defines the capture source fed to `meta_watcher.sources.build_source`.
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `kind` | string | `"webcam"` | One of `webcam`, `rtsp`, `file`. Anything else raises `ValueError`. |
+| `value` | string | `"0"` | Kind-specific. Webcams: integer index as a string, or `"auto"`. RTSP: full URL. File: absolute or relative path. |
+| `width` | int | `1280` | Requested frame width. Only the webcam source tries to set this on the device; cameras may ignore it. |
+| `height` | int | `720` | Requested frame height. Same caveat. |
+| `fps` | int | `30` | Requested capture fps. Same caveat; actual camera fps is logged at startup. |
+
+## `models` (`ModelConfig`)
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `mac_sam_model_id` | string | `"mlx-community/sam3.1-bf16"` | Hugging Face or local model ID used by `MlxSam31Provider`. |
+| `linux_sam_model_id` | string | `"facebook/sam3.1"` | Model ID passed to `sam3.model_builder.build_sam3_image_model`. |
+| `inference_max_side` | int | `960` | Longest side (px) the frame is downscaled to before being passed to the provider. `<=0` disables downscaling. Detection bboxes are upscaled back to the original resolution. |
+| `inference_interval_ms` | int | `250` (`200` in `config.default.json`) | Minimum wall-clock spacing between provider calls. Frames between calls reuse the last detections so the overlay and recording still advance at full rate. |
+
+## `thresholds` (`ThresholdConfig`)
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `person_confidence` | float | `0.3` | Minimum SAM 3.1 score to accept a person detection. Applied in `StreamProcessor._normalize_people`. |
+| `inventory_confidence` | float | `0.25` | Minimum score to keep an inventory detection. |
+| `overlap_iou` | float | `0.5` | IoU above which duplicate person detections are merged by `merge_overlapping_detections` before tracking. |
+| `tracking_iou` | float | `0.3` | Minimum IoU with an existing track for `TrackManager` to reuse that track ID. |
+| `min_area_ratio` | float | `0.002` | Detections smaller than this fraction of the frame area are dropped by `TrackManager.update`. |
+
+## `timings` (`TimingConfig`)
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `empty_scene_rescan_seconds` | float | `5.0` | Dwell time after the last person leaves before `StreamStateMachine` exits `cooldown` back to `inventory`. |
+| `person_confirmation_frames` | int | `3` | Consecutive "people present" frames required to transition from `inventory` to `person_present`. |
+| `pre_roll_seconds` | float | `3.0` (`0.5` in `config.default.json`) | Seconds of frames `ClipRecorder` keeps in its ring buffer so events include the moments before someone enters. |
+| `post_roll_seconds` | float | `2.0` | Seconds of frames written after `finish_event` before the sink closes. |
+
+## `inventory` (`InventoryConfig`)
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `labels` | `list[str]` | `[]` | Open-vocabulary labels SAM 3.1 is asked to validate in `inventory` mode. Empty list disables inventory detection entirely. |
+| `auto_rescan` | bool | `true` | When `true`, the state machine re-triggers an `inventory_reset` after each occupancy event. When `false`, the machine returns to `inventory` mode but leaves the last inventory snapshot in place until a manual rescan. |
+
+## `output` (`OutputConfig`)
+
+| Field | Type | Default | Purpose |
+| ----- | ---- | ------- | ------- |
+| `directory` | string | `"recordings"` | Directory where `ClipRecorder` writes `{source_id}_{UTC}.mp4` + `.json`. Created automatically on startup. |
+
+## Loading rules
+
+- `load_config(None)` returns the dataclass defaults.
+- `load_config(path)` picks YAML when the extension is `.yaml` / `.yml` (requires PyYAML, included in the `[desktop]` extra), otherwise JSON.
+- Top-level keys that aren't one of `source`, `models`, `thresholds`, `timings`, `inventory`, `output` are ignored.
+- Inside each top-level block, unknown keys are ignored by `_merge_dataclass`. Known keys overwrite the default value as-is (no type coercion is performed).
+
+## Runtime patches
+
+`RuntimeState.update_config(patch)` performs a shallow merge over each block — only keys that already exist on the dataclass are copied. The HTTP API exposes this as `PUT /api/config` (see the [HTTP API reference](http-api.md)). `POST /api/runtime/start` optionally accepts the same patch shape in its body.
+
+---
+
+# docs/reference/cli.md
+
+# CLI reference
+
+Entry point: `meta_watcher.app.main`, registered as the console script `meta-watcher` in `pyproject.toml`.
+
+```bash
+meta-watcher [--config PATH] [--host HOST] [--port PORT] [--open-browser]
+```
+
+## Flags
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `--config PATH` | unset (use built-in defaults) | Path to a JSON or YAML config file. See the [configuration reference](configuration.md) for the schema. |
+| `--host HOST` | `127.0.0.1` | Address to bind the HTTP server to. Use `0.0.0.0` to listen on all interfaces. |
+| `--port PORT` | `8765` | Port to bind the HTTP server to. |
+| `--open-browser` | off | Open the system browser at `http://{host}:{port}` after uvicorn starts. |
+
+## Exit codes
+
+- `0` — uvicorn shut down cleanly (stop signal or `ctrl-c`).
+- Any other exit originates from uvicorn / the runtime; the state is stopped from a `finally` block before propagation.
+
+## Startup behavior
+
+1. `argparse` parses flags.
+2. `load_config(args.config)` returns an `AppConfig`.
+3. `RuntimeState(config)` constructs the thread-safe runtime container.
+4. `build_app(state)` returns the FastAPI app.
+5. If `--open-browser` was passed, a daemon thread sleeps 0.4 seconds and then calls `webbrowser.open(url)`.
+6. `uvicorn.run(app, host, port, log_level="warning", access_log=False)` takes over the main thread.
+7. On exit, `state.stop()` tears down the runtime (joins producer + consumer threads, releases the source, shuts down the inference provider).
+
+## Running from the repo
+
+The repo includes `bin/meta-watcher`, a Bash launcher that prepends the repo root and user site-packages to `PYTHONPATH` and then execs `python -m meta_watcher.app`. Use it when you want to run without installing the package:
+
+```bash
+./bin/meta-watcher --config ./config.default.json
+```
+
+It picks `$CONDA_PREFIX/bin/python` first, then `python`, then `python3`. On macOS it also adds the user framework site-packages path so `mlx-vlm` installed with `pip install --user` is visible.
+
+## uvicorn logging
+
+Meta Watcher forces `log_level="warning"` and `access_log=False` to keep the terminal quiet. Errors still surface via `on_error` callbacks into `RuntimeState`, where they are exposed through `/api/snapshot`'s `error` field.
+
+## Environment variables
+
+`meta_watcher/__init__.py` sets a couple of OpenCV environment defaults before `cv2` is ever imported, to reduce backend probing noise. These can still be overridden:
+
+- `OPENCV_LOG_LEVEL=ERROR` — quiets OpenCV's own logger.
+- `OPENCV_VIDEOIO_PRIORITY_OBSENSOR=0` — disables the Orbbec backend probe that otherwise spams `can't open camera by index` lines.
+- `META_WATCHER_BACKEND` — read by the Astro dev server (`web/astro.config.mjs`) to proxy `/api`, `/stream.mjpg`, and `/frame.jpg` to a non-default backend URL.
+
+---
+
+# docs/reference/http-api.md
+
+# HTTP API reference
+
+All endpoints are defined in `meta_watcher/web/server.py::build_app`. The server listens on the `--host` / `--port` passed to `meta-watcher` (default `http://127.0.0.1:8765`). FastAPI's interactive docs are disabled (`docs_url=None`, `redoc_url=None`); use this page as the source of truth.
+
+Content type is `application/json` for API endpoints unless noted.
+
+## Configuration
+
+### `GET /api/config`
+
+Returns the current `AppConfig` as a JSON dict (dataclass-serialized via `asdict`). Shape matches [`configuration.md`](configuration.md).
+
+Response `200`:
+
+```json
+{
+  "source":     { "kind": "webcam", "value": "0", "width": 1280, "height": 720, "fps": 30 },
+  "models":     { "mac_sam_model_id": "...", "linux_sam_model_id": "...", "inference_max_side": 960, "inference_interval_ms": 250 },
+  "thresholds": { "person_confidence": 0.3, "inventory_confidence": 0.25, "overlap_iou": 0.5, "tracking_iou": 0.3, "min_area_ratio": 0.002 },
+  "timings":    { "empty_scene_rescan_seconds": 5.0, "person_confirmation_frames": 3, "pre_roll_seconds": 3.0, "post_roll_seconds": 2.0 },
+  "inventory":  { "labels": [], "auto_rescan": true },
+  "output":     { "directory": "recordings" }
+}
+```
+
+### `PUT /api/config`
+
+Merges a patch into the running config and returns the result. Only keys that already exist on the dataclass block (for example `thresholds.person_confidence`) are applied; unknown keys are silently dropped.
+
+Request body:
+
+```json
+{ "thresholds": { "person_confidence": 0.55 } }
+```
+
+Response `200`: updated `AppConfig` as JSON, same shape as `GET /api/config`.
+
+Response `400`: `{"error": "Config patch must be a JSON object."}` if the body is not a JSON object.
+
+## Runtime lifecycle
+
+### `POST /api/runtime/start`
+
+Starts the capture pipeline. Optionally accepts a config patch in the body, applied before start (same rules as `PUT /api/config`). If the runtime is already running, this is a no-op.
+
+Request body (optional):
+
+```json
+{ "source": { "kind": "webcam", "value": "0" } }
+```
+
+Responses:
+
+- `200` `{ "running": true }` on success.
+- `500` `{ "error": "..." }` if provider or source construction fails (for example, the camera is unavailable).
+
+### `POST /api/runtime/stop`
+
+Stops the runtime (joins producer and consumer threads, releases the source, shuts down the provider). Safe to call when already stopped.
+
+Response `200`: `{ "running": false }`.
+
+### `POST /api/runtime/rescan`
+
+Requests a manual inventory rescan. Latched and applied by `StreamStateMachine` on the next safe transition (see the [state machine doc](../architecture/state-machine.md) for latching rules).
+
+Response `200`: `{ "ok": true }`. This returns `200` even if the runtime is not currently running (it becomes a no-op).
+
+### `POST /api/runtime/recording`
+
+Enable or disable clip recording at runtime. The producer stops calling `push_frame` and the processor stops starting events when disabled. Existing open events are not forcibly closed.
+
+Request body: `{ "enabled": true }` or `{ "enabled": false }`. If the body is missing or malformed, recording is enabled.
+
+Response `200`: `{ "recording_enabled": true }`.
+
+## Pipeline state
+
+### `GET /api/snapshot`
+
+Returns the current pipeline state. Used by the operator UI to refresh once per 500 ms.
+
+Response `200`:
+
+```json
+{
+  "running": true,
+  "mode": "inventory",
+  "status_text": "scene objects: 3",
+  "frame_index": 1287,
+  "source_id": "webcam",
+  "inventory_active": true,
+  "recording_active": false,
+  "inventory_items": [
+    { "label": "chair", "confidence": 0.82, "samples": 1, "last_seen": 1234.5 }
+  ],
+  "completed_clips": [
+    "/abs/path/to/recordings/webcam_20260418T003658Z.mp4"
+  ],
+  "error": null
+}
+```
+
+- `mode` — `idle`, `inventory`, `person_present`, or `cooldown`.
+- `inventory_items` — the configured labels normalized into `InventoryItem` entries. Confidence and samples are placeholders from config (SAM 3.1 is the authority in the per-frame overlays).
+- `completed_clips` — cumulative list of MP4 paths produced since the runtime was last started.
+- `error` — last captured error message from the producer or consumer thread, or `null`.
+
+### `GET /api/devices/webcams`
+
+Enumerates local webcams. On Linux, uses `/dev/video*` + V4L2 capability bits. On macOS, shells out to `system_profiler SPCameraDataType -json` and falls back to probing OpenCV indices `0..3`. Other platforms fall back to probing too.
+
+Response `200`:
+
+```json
+{
+  "devices": [
+    { "value": "0", "label": "FaceTime HD Camera (index 0)", "path": null }
+  ]
+}
+```
+
+`value` is the string form of the OpenCV index that `source.value` expects when `source.kind == "webcam"`.
+
+## Video streams
+
+### `GET /stream.mjpg`
+
+Multipart MJPEG stream (`multipart/x-mixed-replace; boundary=meta-watcher-frame`). Frames are driven by `RuntimeState.wait_for_new_jpeg`:
+
+- While the pipeline is not producing snapshots yet, the producer thread's raw camera frames are encoded and pushed so the preview goes live as soon as the camera opens.
+- After the first `PipelineSnapshot`, the stream emits the annotated overlays.
+- A placeholder "Waiting for camera…" frame is sent if no frames are available.
+
+Each multipart chunk looks like:
+
+```
+--meta-watcher-frame\r\n
+Content-Type: image/jpeg\r\n
+Content-Length: <N>\r\n
+\r\n
+<JPEG bytes>\r\n
+```
+
+The endpoint has no explicit end state; clients should close the connection when done.
+
+### `GET /frame.jpg`
+
+Latest single JPEG, or the "Waiting for camera…" placeholder if nothing has been produced yet. Useful for scripts and snapshots.
+
+Response `200`: `image/jpeg` body.
+
+## Static content
+
+### `GET /`
+
+Serves `meta_watcher/web/static/index.html` (the committed Astro build) via `StaticFiles(html=True)`. If the static directory is missing, the app falls back to a simple HTML page telling the operator to run `cd web && npm install && npm run build`.
+
+Other paths under `/_astro/`, `/content-assets.mjs`, etc., are served by `StaticFiles`.
+
+---
+
+# docs/reference/python-api.md
+
+# Python API reference
+
+Meta Watcher is primarily a CLI + web app, but its modules are importable as a library. This page lists the public surfaces that embedders should treat as stable within a `0.1.x` release. Internal helpers (names starting with `_`) are not covered here; see `meta_watcher/*.py` directly if you need them.
+
+## `meta_watcher.config`
+
+Config dataclasses and loader.
+
+```python
+from meta_watcher.config import AppConfig, default_config, load_config
+```
+
+- `AppConfig(source, models, thresholds, timings, inventory, output)` — root dataclass. `to_dict()` returns an `asdict`-serialized dict.
+- `SourceConfig`, `ModelConfig`, `ThresholdConfig`, `TimingConfig`, `InventoryConfig`, `OutputConfig` — block-level dataclasses. Field-level defaults are listed in [configuration.md](configuration.md).
+- `default_config() -> AppConfig` — built-in defaults, used when no config path is provided.
+- `load_config(path: str | Path | None) -> AppConfig` — loads JSON (anything not ending in `.yaml`/`.yml`) or YAML. Raises `FileNotFoundError` if `path` is set and missing.
+
+## `meta_watcher.core`
+
+Shared types and logic.
+
+- `VideoFrame(image, timestamp, frame_index, source_id, fps=None)` — canonical frame type. `.width`, `.height` come from `image.shape`.
+- `Detection(label, confidence, bbox, mask=None, track_id=None, metadata={})` — canonical detection type. `bbox` is `(x1, y1, x2, y2)` in pixel space.
+- `InventoryItem(label, confidence, samples, last_seen)` — inventory list entry.
+- `PipelineSnapshot(mode, frame_index, source_id, overlay, people, inventory_detections, inventory_items, inventory_active, recording_active, completed_clips, status_text, timings, effective_fps)` — output of `StreamProcessor.process_frame`.
+- `TrackManager(min_iou=0.3, max_missed_frames=12, smoothing=0.35, min_area_ratio=0.002)` — assigns stable IDs to per-frame detections. `update(detections, frame)` returns the tracked detections for that frame; `reset()` clears state.
+- `StreamStateMachine(person_confirmation_frames=3, empty_scene_rescan_seconds=5.0)` — mode transition logic. `observe(timestamp, people_present, *, auto_rescan_enabled)` returns a `StreamDecision(mode, event_started, event_finished, inventory_active, inventory_reset)`. `request_manual_rescan()` latches a rescan.
+- `ClipRecorder(output_dir, *, pre_roll_seconds=3.0, post_roll_seconds=2.0, sink_factory=None)` — pre/post-roll video recorder. Exposes `push_frame`, `start_event`, `finish_event`, `add_person_ids`, `drain_completed`, and `recording_active`. Swappable sinks via `sink_factory(path, size, fps) -> ClipSink`.
+- `OpenCvClipSink(path, size, fps)` — default sink using OpenCV's `VideoWriter`.
+- `EventArtifact(clip_path, metadata_path, started_at, ended_at, person_ids)` — returned by `drain_completed`.
+- `clamp_bbox`, `box_area`, `iou`, `normalize_label`, `is_people_label`, `merge_overlapping_detections` — helpers. `PEOPLE_PROMPTS` and `PEOPLE_LABELS` define the label vocabulary for person detection.
+
+## `meta_watcher.sources`
+
+Video capture.
+
+- `VideoSource` (ABC) with `source_id`, `open()`, `read() -> VideoFrame | None`, `close()`.
+- `OpenCvVideoSource(source_id, capture_value, *, live)` — base class wrapping `cv2.VideoCapture`. RGB-converted on every read.
+- `WebcamSource(value, *, width, height, fps)` — retries opening across a candidate list, requests the desired resolution, and logs actual vs. requested.
+- `RtspSource(url)`, `FileSource(path)` — thin subclasses for RTSP URLs and local files.
+- `build_source(config: SourceConfig) -> VideoSource` — factory used by the runtime.
+- `list_webcams() -> list[WebcamDevice]` — platform-aware enumeration with V4L2 + macOS `system_profiler` paths.
+
+## `meta_watcher.inference`
+
+SAM 3.1 providers.
+
+- `InferenceProvider` (ABC) — `warmup`, `detect_text_prompts(frame, prompts)`, `start_tracking(frame, prompts)`, `track_next(frame)`, `shutdown`.
+- `MlxSam31Provider(model_id)` — in-process MLX implementation; imports `mlx_vlm` lazily inside `warmup`.
+- `MlxSubprocessSam31Provider(model_id, timeout_seconds=120.0)` — spawns a `multiprocessing` worker running `MlxSam31Provider`. Default on Apple Silicon.
+- `CudaSam31Provider(model_id)` — CUDA implementation using `facebookresearch/sam3`. Applies the `sam3.perflib.fused.addmm_act` fp32 patch on first warmup.
+- `build_provider(models: ModelConfig) -> InferenceProvider` — platform router used by the runtime.
+
+## `meta_watcher.overlay`
+
+- `render_overlay(frame, *, detections, inventory, mode, inventory_active, recording_active, status_text, hud_timings=None, hud_fps=0.0) -> np.ndarray` — draws masks, bboxes, labels, HUD, and the inventory list on an RGB frame. Returns RGB.
+
+## `meta_watcher.pipeline`
+
+- `StreamProcessor(config, provider, recorder)` — pure per-frame processor. `process_frame(frame) -> PipelineSnapshot`. Supports `request_manual_rescan()`, `set_recording_enabled(bool)`, and `update_labels(list[str])`.
+- `StreamRuntime(source, processor, *, on_snapshot, on_error, on_raw_frame=None, queue_size=2)` — producer/consumer threads wrapping a source and a processor. `start()`, `stop()`, `request_manual_rescan()`, `set_recording_enabled(bool)`.
+
+## `meta_watcher.web`
+
+- `RuntimeState(config=None, *, provider_factory=None, source_factory=None, jpeg_quality=80)` — thread-safe wrapper owning the `StreamRuntime`, the latest JPEG, and the cumulative completed-clip list. Factory overrides are how tests inject fake providers and sources.
+- `build_app(state: RuntimeState) -> FastAPI` — constructs the FastAPI app with all endpoints documented in [http-api.md](http-api.md).
+
+## `meta_watcher.app`
+
+- `main(argv: list[str] | None = None) -> int` — CLI entry. Used by the `meta-watcher` console script.
+
+---
+
+# docs/internals/pipeline.md
+
+# Pipeline internals
+
+This page dives into `meta_watcher/pipeline.py`. Read the [architecture overview](../architecture/overview.md) first for the component picture.
+
+## `StreamProcessor.process_frame`
+
+Each call performs the following stages, in order, timed in milliseconds and reported on `PipelineSnapshot.timings`:
+
+1. **Inference gating.** If `(frame.timestamp - _last_inference_ts) >= inference_interval_ms / 1000`, run the provider; otherwise reuse the previous detections. Frames between inferences still get a fresh tracker update using the cached detections, which is how the recorded overlay keeps animating at full frame rate.
+2. **Downscaling.** `_downscale_for_inference` uses OpenCV `cv2.resize` (INTER_AREA) to fit the longest side of the frame into `inference_max_side`. The scale factor is recorded so `_upscale_detections` can map bboxes back into the original coordinate space.
+3. **Provider call.**
+   - In `inventory` mode: `detect_text_prompts(frame, PEOPLE_PROMPTS)` first. Inventory labels are a separate call (`detect_text_prompts(frame, inventory_labels)`) only if no people are present.
+   - In `person_present` / `cooldown`: `track_next(frame)` is preferred once `_tracking_live` is true, otherwise the person detection call.
+4. **Person normalization + tracking.** `_normalize_people` drops anything below `thresholds.person_confidence`, renames the label to `person`, and merges duplicate boxes. `TrackManager.update` assigns stable IDs.
+5. **State machine observation.** `StreamStateMachine.observe(timestamp, people_present, auto_rescan_enabled=config.inventory.auto_rescan)` returns the decision for this frame.
+6. **Event start hook.** If `decision.event_started`, the processor calls `provider.start_tracking(frame, PEOPLE_PROMPTS)` so providers can reset their internal tracking state. It also clears `_event_person_ids` and resets the inference interval so the next frame re-runs inference immediately.
+7. **Inventory detection.** Runs only if we're in inventory mode, inventory is active, no people are present, and there are configured labels. Filters by `thresholds.inventory_confidence`.
+8. **Overlay.** `render_overlay` receives the current detections, inventory list, mode flags, HUD timings, and effective fps.
+9. **Recorder drive.** On `event_started` → `recorder.start_event(frame, inventory_labels)`. On every frame with an active event → `recorder.add_person_ids(sorted(_event_person_ids))`. On `event_finished` → `recorder.finish_event(timestamp, sorted(_event_person_ids))`. `drain_completed` pulls any artifacts that have been closed in the meantime.
+10. **Timings accounting.** Rolling windows of the last 30 samples per stage; average latencies and effective fps are surfaced on every snapshot and logged once per second.
+
+## Downscaling and upscaling
+
+```python
+def _downscale_for_inference(frame, max_side):
+    if max_side <= 0 or max(frame.height, frame.width) <= max_side:
+        return frame, 1.0
+    ratio = max_side / max(frame.height, frame.width)
+    return VideoFrame(image=resized, ...), 1.0 / ratio
+```
+
+- `cv2` is imported lazily so the module still works without OpenCV (tests that don't need downscaling won't pay the import).
+- `_upscale_detections` multiplies bbox coordinates by the returned scale factor and clamps to frame bounds.
+
+## Rate limiting
+
+- `inference_interval_ms` is a *lower bound* between provider calls, not a fixed cadence. If inference itself takes longer than the interval, the next call happens as soon as inference finishes.
+- Between calls, `_cached_people_candidates` and `_cached_inventory_detections` are reused. `_cached_inventory_detections` is cleared when we leave `inventory` mode to avoid stale overlays.
+- Tests (`test_pipeline.py::test_inference_rate_limited_by_interval`) assert the gating math at 100 ms frame spacing and 500 ms interval: 6 frames produce 2 provider calls.
+
+## `StreamRuntime`
+
+- Two daemon threads, `meta-watcher-source` (producer) and `meta-watcher-pipeline` (consumer).
+- `_put_latest` replaces the queued frame if the queue is full (size 2). This keeps consumer latency proportional to inference time instead of building up a backlog.
+- `on_raw_frame` is invoked on the producer thread before the queue push so `RuntimeState` can display a live preview during model warmup.
+- `stop()` sets the stop event, joins both threads with a 2-second timeout, then closes the source and calls `processor.provider.shutdown()`. The finally guarantees provider shutdown even if the consumer raised.
+- If the source reports `live=False` (file playback), the producer sleeps `1/fps` seconds between frames so playback runs at the file's recorded rate.
+
+## Timing windows
+
+`_stage_samples` and `_frame_wall_times` are `collections.deque(maxlen=30)`. Short windows keep the HUD responsive after transitions (you see the real cost of the current mode quickly), at the cost of ignoring older history. If you need longer-horizon metrics, tee the timings off `PipelineSnapshot.timings` in a consumer rather than enlarging the windows.
+
+## Extending
+
+- New modes: extend `StreamStateMachine` with explicit transitions and surface the new mode through `decision.mode`. `StreamProcessor` uses the mode string directly in `visible_detections = tracked_people if decision.mode in {"person_present", "cooldown"} else inventory_detections` — update both the state machine and the processor to keep them in sync.
+- New detection types: add a branch in `StreamProcessor.process_frame` for the extra provider call, then extend `PipelineSnapshot` with a new field so consumers can read it. Remember to update `render_overlay` for display and `RuntimeState.snapshot_payload` for the HTTP surface.
+- Swapping inference providers: pass a custom `provider_factory` to `RuntimeState` (see `tests/test_app.py::WebServerTests._build_client` for the pattern).
+
+---
+
+# docs/internals/web-state.md
+
+# Web runtime state internals
+
+`meta_watcher.web.state.RuntimeState` is the thread-safe container the HTTP layer talks to. It owns the `StreamRuntime`, the latest JPEG buffer, the cumulative list of completed clips, and the latest snapshot/error. Understanding its locking rules matters when you extend the HTTP surface.
+
+## Threading model
+
+- `_lock: threading.Lock` — guards all mutable fields.
+- `_frame_cond: threading.Condition(self._lock)` — used to wait for a new JPEG. Sharing the underlying lock means readers and writers do not need a second acquisition.
+
+Callers fall into four roles:
+
+1. **HTTP handlers (FastAPI)** — call `config`, `config_dict`, `update_config`, `snapshot_payload`, `latest_jpeg`, `wait_for_new_jpeg`, `start`, `stop`, `rescan`, `set_recording_enabled`.
+2. **Consumer thread** (via `StreamRuntime.on_snapshot`) — calls `_on_snapshot(snapshot)`. Heavy work: JPEG encoding. Hot critical section: updating the cond-protected frame buffer.
+3. **Producer thread** (via `on_raw_frame`) — calls `_on_raw_frame(frame)` while the pipeline is not yet live, so the MJPEG stream has *something* to show during model warmup. Short-circuits once `_pipeline_live` becomes true so annotated frames aren't overwritten.
+4. **Error path** (either thread) — calls `_on_error(message)`. Sets `_error`, clears `_runtime`, bumps the JPEG version so the MJPEG waiter wakes up.
+
+## Startup sequence
+
+```mermaid
+sequenceDiagram
+    participant HTTP as POST /api/runtime/start
+    participant State as RuntimeState
+    participant Runtime as StreamRuntime
+    HTTP->>State: state.start(patch)
+    State->>State: update_config(patch) (if provided)
+    State->>State: _provider_factory(config)
+    State->>State: ClipRecorder(output_dir, pre_roll, post_roll)
+    State->>State: StreamProcessor(config, provider, recorder)
+    State->>State: _source_factory(config)
+    State->>Runtime: StreamRuntime(source, processor, callbacks).start()
+```
+
+`start` is a no-op if `_runtime` is already set. The patch is applied *before* the provider/source are built so factory overrides see the freshly merged config. Tests use the `_provider_factory` / `_source_factory` attributes directly to inject fakes.
+
+## MJPEG waiter
+
+`wait_for_new_jpeg(last_version, timeout)` blocks on the condition until `_latest_jpeg_version` changes, with a timeout. The version is incremented in `_on_snapshot`, `_on_raw_frame` (while warmup is live), and `_on_error`. The MJPEG generator handles the timeout case by resending the last available JPEG, which keeps the browser connection alive across idle stretches.
+
+## JPEG encoding
+
+- Done in `_on_snapshot` on the consumer thread so all MJPEG listeners receive a pre-encoded buffer.
+- Quality is fixed at `jpeg_quality=80` by default; constructor parameter allows tests to lower it for speed.
+- JPEG timings are averaged in a 30-sample deque and logged once per second (`[meta-watcher] jpeg_encode_avg=...ms`).
+
+## Placeholder JPEG
+
+`placeholder_jpeg()` memoizes a 1280×720 "Waiting for camera…" image the first time it's called. It's returned by `/frame.jpg` and by the MJPEG generator whenever the state has no JPEG available.
+
+## Snapshot payload
+
+`snapshot_payload()` walks `_latest_snapshot` plus cumulative fields (`_completed_clips`, `_error`, running flag). The idle-state branch is used before the first real snapshot arrives, which is why the shape includes `frame_index: None` and `source_id: None`.
+
+## Config merging
+
+`update_config(patch)` uses the module-level `_merge_config(base, patch)` helper:
+
+- Converts the base `AppConfig` to a dict via `asdict`.
+- Shallow-merges each block, keeping only keys that already exist in the dataclass dict.
+- Rebuilds the dataclasses block by block.
+
+This is intentionally conservative: unknown keys never cause a mutation, typed dataclasses stay valid, and a partial patch leaves the rest of the config untouched.
+
+## Error recovery
+
+`_on_error` clears `_runtime`, which means the next `is_running()` call returns `False` even though uvicorn is still serving and the thread has not fully unwound. The operator can call `POST /api/runtime/start` again to retry. The previous error message stays in `_error` until the next snapshot arrives.
+
+If you add a new long-lived background job, route its failures through `_on_error` so the UI's error banner stays consistent.
+
+---
+
+# docs/internals/inference.md
+
+# Inference internals
+
+This page documents the two things about `meta_watcher/inference.py` that are easy to break: the MLX subprocess RPC protocol and the `sam3.perflib` fp32 patch.
+
+## MLX subprocess RPC
+
+`MlxSubprocessSam31Provider` wraps an in-process `MlxSam31Provider` in a dedicated `multiprocessing` process using the `spawn` start method. This is the default on macOS arm64.
+
+### Protocol
+
+Request messages pushed onto `request_queue`:
+
+```python
+{"method": "warmup" | "detect" | "start_tracking" | "track_next" | "shutdown",
+ "payload": { ... }}
+```
+
+Response messages pushed onto `response_queue`:
+
+```python
+{"ok": True, "payload": <method-specific>}                       # success
+{"ok": False, "error": "<name>: <msg>", "traceback": "<text>"}   # failure
+```
+
+Method payloads:
+
+| Method            | Request payload                                  | Response payload               |
+| ----------------- | ------------------------------------------------ | ------------------------------ |
+| `warmup`          | `{}`                                             | `None`                         |
+| `detect`          | `{"frame": serialized, "prompts": list[str]}`    | `list[serialized detection]`   |
+| `start_tracking`  | `{"frame": serialized, "prompts": list[str]}`    | `list[serialized detection]`   |
+| `track_next`      | `{"frame": serialized}`                          | `list[serialized detection]`   |
+| `shutdown`        | `{}`                                             | no response (worker exits)     |
+
+`_serialize_frame` turns a `VideoFrame` into a dict with a numpy `image`, `timestamp`, `frame_index`, `source_id`, and optional `fps`. `_serialize_detections` walks each `Detection` into a dict of pure primitives plus a numpy mask when present. Deserializers mirror these transforms.
+
+### Timeouts and failure
+
+`_rpc` polls `response_queue.get(timeout=0.2)` in a loop until the overall `timeout_seconds` deadline (default 120 s). If the worker process dies while a call is pending, the next poll detects `not self._process.is_alive()` and raises `RuntimeError("The MLX worker process exited unexpectedly.")`.
+
+On `shutdown`, the provider sends the message, joins the process with a 5-second grace period, and calls `terminate()` if it's still alive. This sequence is also run in `RuntimeState.stop()` → `StreamRuntime.stop()` → `provider.shutdown()`.
+
+### Why not shared memory
+
+Frames and detections are small enough that the cost of marshaling through `multiprocessing.Queue` is not the bottleneck, and staying on plain queues keeps the serialization story readable. If a future version needs large per-frame buffers (raw masks, say), consider switching to `multiprocessing.shared_memory` for the image payload; the rest of the dict can stay on the queue.
+
+## `sam3.perflib` fp32 patch
+
+`CudaSam31Provider.warmup` calls `_patch_sam3_fused_addmm_to_fp32()` before building the model.
+
+### The upstream issue
+
+`facebookresearch/sam3` ships a fused addmm+activation helper:
+
+```python
+# sam3/perflib/fused.py
+def addmm_act(activation, linear, mat1):
+    # hard-casts mat1, linear.weight, linear.bias to bfloat16
+    # calls torch.ops.aten._addmm_activation(...)
+    ...
+```
+
+It is bound by name into `sam3/model/vitdet.py` (`from sam3.perflib.fused import addmm_act`). When the rest of the graph is kept in `fp32`, the fused op returns bf16 outputs that then feed an fp32 Linear and PyTorch raises:
+
+```
+RuntimeError: mat1 and mat2 must have the same dtype: float vs bfloat16
+```
+
+### The patch
+
+```python
+def _addmm_act_fp32(activation, linear, mat1):
+    y = torch.nn.functional.linear(mat1, linear.weight, linear.bias)
+    if activation in (torch.nn.functional.gelu, torch.nn.GELU):
+        return torch.nn.functional.gelu(y)
+    if activation in (torch.nn.functional.relu, torch.nn.ReLU):
+        return torch.nn.functional.relu(y)
+    raise ValueError(f"Unexpected activation {activation}")
+```
+
+The patch rebinds both `sam3.perflib.fused.addmm_act` (the module-level symbol) *and* `sam3.model.vitdet.addmm_act` (the symbol already imported at module load time). Without the second binding, `vitdet` would keep using the original fused op via its local alias and the patch would have no effect.
+
+### Idempotency
+
+`_SAM3_FUSED_PATCHED` guards against re-patching. Subsequent warmups (for example after a reconfigure that rebuilds the provider) skip the patch.
+
+### What if upstream changes
+
+The patch is tightly coupled to upstream. If upstream renames `addmm_act`, moves it out of `perflib`, fixes the dtype handling, or adds a third activation (swiglu, etc.), the patch needs to follow. The failure mode is explicit: either an `ImportError` inside `_patch_sam3_fused_addmm_to_fp32` (silently ignored — we assume the patch target is gone) or a `ValueError("Unexpected activation ...")` on the next forward.
+
+When bumping the Linux extra, run at least one real CUDA forward to catch drift:
+
+```bash
+python3 -c "
+from meta_watcher.config import default_config
+from meta_watcher.inference import build_provider, CudaSam31Provider
+provider = build_provider(default_config().models)
+provider.warmup()
+"
+```
+
+## Input movement helper
+
+`_move_inputs_to_model` is a generic helper shared between providers and tests:
+
+- Reads `device` and `dtype` from the model (preferring explicit attributes, then the first parameter).
+- Moves every tensor to that device.
+- Casts floating-point tensors to that dtype; leaves non-floating tensors alone.
+- Non-tensor values pass through unchanged.
+
+The CUDA path does not currently call this helper on its way into the Sam3 processor (it calls `model._apply(_cast)` instead), but it's kept available for future providers and is unit-tested in `tests/test_inference.py`.
+
