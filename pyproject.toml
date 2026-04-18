@@ -34,8 +34,23 @@ linux = [
   "torch>=2.7",
   "torchvision>=0.22",
 ]
+detr = [
+  "transformers>=4.46",
+  "torch>=2.7",
+  "torchvision>=0.22",
+  "timm",
+]
 dev = [
   "pytest>=8.3",
+]
+gcp = [
+  "google-cloud-storage>=2.18",
+]
+aws = [
+  "boto3>=1.35",
+]
+oci = [
+  "oci>=2.134",
 ]
 
 [project.scripts]

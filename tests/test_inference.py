@@ -8,7 +8,17 @@ import tomllib
 import unittest
 from unittest import mock
 
-from meta_watcher.inference import CudaSam31Provider, _move_inputs_to_model
+import numpy as np
+
+from meta_watcher.config import ModelConfig
+from meta_watcher.core import VideoFrame
+from meta_watcher.inference import (
+    CudaSam31Provider,
+    TransformersObjectDetectionProvider,
+    _matches_any_prompt,
+    _move_inputs_to_model,
+    build_provider,
+)
 
 
 class LinuxInferenceInstallTests(unittest.TestCase):
@@ -159,6 +169,183 @@ class LinuxInferenceInstallTests(unittest.TestCase):
         self.assertEqual(pixel_values.calls, [{"device": "cuda:0", "dtype": "bfloat16"}])
         self.assertEqual(input_ids.calls, [{"device": "cuda:0"}])
         self.assertEqual(moved["meta"], "keep")
+
+
+class TransformersProviderTests(unittest.TestCase):
+    def test_build_provider_routes_detr(self) -> None:
+        models = ModelConfig(provider="detr-resnet-50")
+        provider = build_provider(models)
+        self.assertIsInstance(provider, TransformersObjectDetectionProvider)
+        self.assertEqual(provider.model_id, models.detr_model_id)
+
+    def test_build_provider_routes_rt_detrv2(self) -> None:
+        models = ModelConfig(provider="rt-detrv2")
+        provider = build_provider(models)
+        self.assertIsInstance(provider, TransformersObjectDetectionProvider)
+        self.assertEqual(provider.model_id, models.rt_detr_model_id)
+
+    def test_build_provider_rejects_unknown_provider(self) -> None:
+        models = ModelConfig(provider="nope")
+        with self.assertRaises(ValueError):
+            build_provider(models)
+
+    def test_matches_any_prompt_covers_coco_variants(self) -> None:
+        self.assertTrue(_matches_any_prompt("potted plant", ["plant"]))
+        self.assertTrue(_matches_any_prompt("dining table", ["table"]))
+        self.assertTrue(_matches_any_prompt("person", ["person", "human"]))
+        self.assertTrue(_matches_any_prompt("laptop", ["laptop"]))
+        # normalize_label strips trailing plural "s"
+        self.assertTrue(_matches_any_prompt("chairs", ["chair"]))
+        # negative cases
+        self.assertFalse(_matches_any_prompt("traffic light", ["chair"]))
+        self.assertFalse(_matches_any_prompt("person", ["chair", "table"]))
+
+    def test_transformers_provider_filters_by_prompt(self) -> None:
+        provider = TransformersObjectDetectionProvider("test/model")
+
+        scripted_result = {
+            "scores": np.array([0.9, 0.8, 0.7, 0.6]),
+            "labels": np.array([0, 1, 2, 3]),
+            "boxes": np.array(
+                [
+                    [10.0, 20.0, 100.0, 200.0],
+                    [150.0, 100.0, 300.0, 250.0],
+                    [400.0, 300.0, 500.0, 400.0],
+                    [50.0, 50.0, 60.0, 60.0],
+                ]
+            ),
+        }
+
+        class FakeProcessor:
+            def __init__(self) -> None:
+                self.post_process_calls: list[dict[str, object]] = []
+
+            def __call__(self, images, return_tensors="pt"):
+                return {"pixel_values": "sentinel"}
+
+            def post_process_object_detection(
+                self, outputs, threshold, target_sizes
+            ):
+                self.post_process_calls.append(
+                    {
+                        "threshold": threshold,
+                        "target_sizes": target_sizes,
+                    }
+                )
+                return [scripted_result]
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.config = types.SimpleNamespace(
+                    id2label={
+                        0: "person",
+                        1: "chair",
+                        2: "potted plant",
+                        3: "bicycle",
+                    }
+                )
+                self.train_calls: list[bool] = []
+                self.device = None
+                self.call_log: list[dict[str, object]] = []
+
+            def to(self, device):
+                self.device = device
+                return self
+
+            def train(self, mode: bool) -> "FakeModel":
+                self.train_calls.append(mode)
+                return self
+
+            def __call__(self, **kwargs):
+                self.call_log.append(kwargs)
+                return types.SimpleNamespace(outputs="sentinel")
+
+        fake_processor = FakeProcessor()
+        fake_model = FakeModel()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoImageProcessor = types.SimpleNamespace(
+            from_pretrained=lambda model_id, trust_remote_code=False: fake_processor
+        )
+        fake_transformers.AutoModelForObjectDetection = types.SimpleNamespace(
+            from_pretrained=lambda model_id, trust_remote_code=False: fake_model
+        )
+
+        class FakeInferenceMode:
+            def __enter__(self) -> "FakeInferenceMode":
+                return self
+
+            def __exit__(self, *args) -> bool:
+                return False
+
+        class FakeTorch:
+            class cuda:
+                @staticmethod
+                def is_available() -> bool:
+                    return False
+
+            class backends:
+                class mps:
+                    @staticmethod
+                    def is_available() -> bool:
+                        return False
+
+            @staticmethod
+            def device(name: str):
+                return types.SimpleNamespace(type=name)
+
+            @staticmethod
+            def inference_mode():
+                return FakeInferenceMode()
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "transformers": fake_transformers,
+                "torch": FakeTorch,
+            },
+        ):
+            frame = VideoFrame(
+                image=np.zeros((480, 640, 3), dtype=np.uint8),
+                timestamp=0.0,
+                frame_index=0,
+                source_id="test",
+                fps=30.0,
+            )
+            detections = provider.detect_text_prompts(frame, ["chair", "plant"])
+
+        self.assertEqual([d.label for d in detections], ["chair", "potted plant"])
+        self.assertEqual([round(d.confidence, 2) for d in detections], [0.8, 0.7])
+        self.assertTrue(all(d.mask is None for d in detections))
+        self.assertEqual(fake_model.train_calls, [False])
+        self.assertEqual(fake_processor.post_process_calls[0]["target_sizes"], [(480, 640)])
+
+    def test_transformers_provider_reports_missing_dep(self) -> None:
+        provider = TransformersObjectDetectionProvider("test/model")
+        original_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "transformers" or name.startswith("transformers."):
+                raise ImportError("No module named 'transformers'")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaises(RuntimeError) as exc:
+                provider.warmup()
+
+        message = str(exc.exception)
+        self.assertIn("transformers", message)
+        self.assertIn('.[desktop,detr]', message)
+
+    def test_pyproject_defines_detr_extra(self) -> None:
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+
+        detr_extra = data["project"]["optional-dependencies"]["detr"]
+
+        joined = "\n".join(detr_extra)
+        self.assertIn("transformers", joined)
+        self.assertIn("torch", joined)
 
 
 if __name__ == "__main__":

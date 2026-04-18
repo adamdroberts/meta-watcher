@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import queue
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -195,6 +198,137 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["content-type"], "image/jpeg")
         self.assertTrue(response.content.startswith(b"\xff\xd8"))
+
+
+class SettingsApiTests(unittest.TestCase):
+    """End-to-end tests for the /api/config/files, /switch, /save endpoints."""
+
+    def setUp(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi is not installed; skipping web tests.")
+        self.TestClient = TestClient
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.root = Path(self._tempdir.name)
+
+    def _write_config(self, name: str, payload: dict[str, Any]) -> Path:
+        path = self.root / name
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def _build_client(
+        self,
+        *,
+        active: Path | None = None,
+    ) -> tuple[Any, RuntimeState]:
+        state = RuntimeState(
+            default_config(),
+            active_config_path=active,
+            search_dirs=[self.root],
+        )
+        state._provider_factory = lambda config: _FakeProvider()
+        state._source_factory = lambda config: _ScriptedSource()
+        app = build_app(state)
+        return self.TestClient(app), state
+
+    def test_list_config_files_returns_active_and_entries(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        b = self._write_config("b.json", {"source": {"kind": "file"}})
+        client, state = self._build_client(active=a)
+        response = client.get("/api/config/files")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["active"], str(a.resolve()))
+        names = sorted(entry["name"] for entry in payload["files"])
+        self.assertEqual(names, ["a.json", "b.json"])
+        active_entries = [e for e in payload["files"] if e["active"]]
+        self.assertEqual(len(active_entries), 1)
+        self.assertEqual(active_entries[0]["name"], "a.json")
+
+    def test_switch_config_loads_new_values(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        b = self._write_config(
+            "b.json", {"source": {"kind": "file", "value": "/tmp/v.mp4"}}
+        )
+        client, state = self._build_client(active=a)
+        response = client.post("/api/config/switch", json={"path": str(b)})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["active"], str(b.resolve()))
+        self.assertEqual(body["config"]["source"]["kind"], "file")
+        self.assertEqual(body["config"]["source"]["value"], "/tmp/v.mp4")
+        self.assertFalse(body["requires_restart"])
+        # Active path updated on the state too.
+        self.assertEqual(state.active_config_path(), b.resolve())
+
+    def test_switch_config_flags_requires_restart_when_running(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        b = self._write_config("b.json", {"source": {"kind": "file"}})
+        client, state = self._build_client(active=a)
+        # Cheap mock for running state — tests don't need a full StreamRuntime.
+        state._runtime = object()  # type: ignore[assignment]
+        try:
+            response = client.post("/api/config/switch", json={"path": str(b)})
+        finally:
+            state._runtime = None
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["running"])
+        self.assertTrue(body["requires_restart"])
+
+    def test_switch_config_rejects_path_outside_search_dirs(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        client, _state = self._build_client(active=a)
+        response = client.post("/api/config/switch", json={"path": "/etc/passwd"})
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("outside", response.json()["error"])
+
+    def test_switch_config_missing_file_returns_404(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        client, _state = self._build_client(active=a)
+        response = client.post(
+            "/api/config/switch", json={"path": str(self.root / "nope.json")}
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_save_config_writes_atomically(self) -> None:
+        a = self._write_config("a.json", {"source": {"kind": "rtsp"}})
+        client, state = self._build_client(active=a)
+        put = client.put(
+            "/api/config",
+            json={"thresholds": {"person_confidence": 0.42}},
+        )
+        self.assertEqual(put.status_code, 200)
+        save = client.post("/api/config/save")
+        self.assertEqual(save.status_code, 200)
+        body = save.json()
+        self.assertEqual(body["path"], str(a.resolve()))
+        self.assertGreater(body["bytes_written"], 0)
+
+        # Round-trip the persisted file.
+        persisted = json.loads(a.read_text(encoding="utf-8"))
+        self.assertAlmostEqual(persisted["thresholds"]["person_confidence"], 0.42)
+        self.assertTrue(a.read_text(encoding="utf-8").endswith("\n"))
+        # No tmp file left behind.
+        self.assertFalse((self.root / "a.json.tmp").exists())
+
+    def test_save_config_without_active_path_returns_400(self) -> None:
+        client, _state = self._build_client(active=None)
+        response = client.post("/api/config/save")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("active", response.json()["error"].lower())
+
+    def test_put_config_invalid_section_shape_returns_400(self) -> None:
+        a = self._write_config("a.json", {})
+        client, _state = self._build_client(active=a)
+        # A known top-level section must be a JSON object; sending a scalar
+        # used to silently drop; now it surfaces as 400 so UIs catch bugs.
+        response = client.put("/api/config", json={"thresholds": 42})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("thresholds", response.json()["error"])
 
 
 if __name__ == "__main__":

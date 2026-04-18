@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -109,7 +110,7 @@ class PipelineSnapshot:
     inventory_items: list[InventoryItem]
     inventory_active: bool
     recording_active: bool
-    completed_clips: list[Path]
+    completed_clips: list["EventArtifact"]
     status_text: str
     timings: dict[str, float] = field(default_factory=dict)
     effective_fps: float = 0.0
@@ -344,6 +345,8 @@ class EventArtifact:
     started_at: float
     ended_at: float
     person_ids: list[str]
+    snapshot_path: Path | None = None
+    overlay_clip_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -359,9 +362,16 @@ class _OpenEvent:
     started_at: float
     inventory: list[str]
     source_id: str
-    sink: ClipSink
+    raw_sink: ClipSink | None = None
+    raw_path: Path | None = None
+    overlay_sink: ClipSink | None = None
+    overlay_path: Path | None = None
+    snapshot_path: Path | None = None
     end_requested_at: float | None = None
     person_ids: set[str] = field(default_factory=set)
+
+
+_RECORDING_MODES = ("raw", "overlay", "both")
 
 
 class ClipRecorder:
@@ -372,17 +382,26 @@ class ClipRecorder:
         pre_roll_seconds: float = 3.0,
         post_roll_seconds: float = 2.0,
         sink_factory: Any | None = None,
+        mode: str = "raw",
     ) -> None:
+        if mode not in _RECORDING_MODES:
+            raise ValueError(
+                f"Unknown recording_mode {mode!r}. Expected one of: {', '.join(_RECORDING_MODES)}."
+            )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pre_roll_seconds = pre_roll_seconds
         self.post_roll_seconds = post_roll_seconds
         self.sink_factory = sink_factory or self._default_sink_factory
-        self._buffer: deque[_BufferedFrame] = deque()
+        self.mode = mode
+        self._raw_enabled = mode in ("raw", "both")
+        self._overlay_enabled = mode in ("overlay", "both")
+        self._raw_buffer: deque[_BufferedFrame] = deque()
+        self._overlay_buffer: deque[_BufferedFrame] = deque()
         self._event: _OpenEvent | None = None
         self._completed: list[EventArtifact] = []
-        # Producer thread calls push_frame; consumer thread calls start/finish/drain.
-        # Use an RLock so start_event can delegate to helper methods without deadlocking.
+        # Producer thread calls push_frame; consumer thread calls start/finish/drain
+        # and push_overlay_frame. Use an RLock so helpers can re-enter.
         self._lock = threading.RLock()
 
     def _default_sink_factory(self, path: Path, size: tuple[int, int], fps: float) -> ClipSink:
@@ -393,47 +412,95 @@ class ClipRecorder:
         with self._lock:
             return self._event is not None
 
+    def active_event_info(self) -> tuple[str, Path | None] | None:
+        """Return (event_id, snapshot_path) for the open event, else None.
+
+        `event_id` is the clip filename stem (e.g. `cam_20260418T122301Z`), stable
+        for the event's entire lifetime. Used by downstream consumers (uploader)
+        to group artifacts + live frames into a per-event folder.
+        """
+        with self._lock:
+            event = self._event
+            if event is None:
+                return None
+            return (event.clip_path.stem, event.snapshot_path)
+
     def push_frame(
         self,
         frame: VideoFrame,
         image: np.ndarray | None = None,
     ) -> list[EventArtifact]:
-        """Buffer the frame and, if an event is open, write it to the sink.
+        """Buffer the raw frame and, if an event is open and raw recording is
+        enabled, write it to the raw sink.
 
         Safe to call from any thread. Returns the artifact list for anything
-        closed by *this* call. Items are still accumulated on the internal
+        finalized by *this* call. Items are still accumulated on the internal
         completed list so consumers can pick them up via `drain_completed`.
-        The optional `image` override exists for tests and legacy callers;
-        default is to write the raw camera pixels (`frame.image`).
+        The optional `image` override is for tests; default is to write the
+        raw camera pixels (`frame.image`). In ``overlay``-only mode this
+        method is a no-op so the producer thread does not need to know about
+        the mode.
         """
+        if not self._raw_enabled:
+            return []
         payload = image if image is not None else frame.image
         newly_closed: list[EventArtifact] = []
         with self._lock:
-            self._buffer.append(
+            self._raw_buffer.append(
                 _BufferedFrame(timestamp=frame.timestamp, image=np.array(payload, copy=True))
             )
-            self._prune_buffer(frame.timestamp)
+            self._prune_buffer(self._raw_buffer, frame.timestamp)
 
-            if self._event is not None:
-                self._event.sink.write(payload)
-                if (
-                    self._event.end_requested_at is not None
-                    and frame.timestamp >= self._event.end_requested_at
-                ):
-                    artifact = self._close_event(frame.timestamp)
-                    if artifact is not None:
-                        newly_closed.append(artifact)
+            if self._event is not None and self._event.raw_sink is not None:
+                self._event.raw_sink.write(payload)
+                self._maybe_close_channel("raw", frame.timestamp)
+                artifact = self._maybe_finalize(frame.timestamp)
+                if artifact is not None:
+                    newly_closed.append(artifact)
         return newly_closed
 
-    def _prune_buffer(self, now: float) -> None:
-        while self._buffer and (now - self._buffer[0].timestamp) > self.pre_roll_seconds:
-            self._buffer.popleft()
+    def push_overlay_frame(
+        self,
+        frame: VideoFrame,
+        overlay_image: np.ndarray,
+    ) -> list[EventArtifact]:
+        """Buffer the overlay frame and, if an event is open and overlay
+        recording is enabled, write it to the overlay sink.
 
-    def _estimate_buffer_fps(self, *, fallback: float) -> float:
-        if len(self._buffer) >= 2:
-            span = self._buffer[-1].timestamp - self._buffer[0].timestamp
+        Called on the consumer thread after ``render_overlay``. In
+        ``raw``-only mode this method is a no-op.
+        """
+        if not self._overlay_enabled:
+            return []
+        newly_closed: list[EventArtifact] = []
+        with self._lock:
+            self._overlay_buffer.append(
+                _BufferedFrame(
+                    timestamp=frame.timestamp,
+                    image=np.array(overlay_image, copy=True),
+                )
+            )
+            self._prune_buffer(self._overlay_buffer, frame.timestamp)
+
+            if self._event is not None and self._event.overlay_sink is not None:
+                self._event.overlay_sink.write(overlay_image)
+                self._maybe_close_channel("overlay", frame.timestamp)
+                artifact = self._maybe_finalize(frame.timestamp)
+                if artifact is not None:
+                    newly_closed.append(artifact)
+        return newly_closed
+
+    def _prune_buffer(self, buffer: deque[_BufferedFrame], now: float) -> None:
+        while buffer and (now - buffer[0].timestamp) > self.pre_roll_seconds:
+            buffer.popleft()
+
+    def _estimate_buffer_fps(
+        self, buffer: deque[_BufferedFrame], *, fallback: float
+    ) -> float:
+        if len(buffer) >= 2:
+            span = buffer[-1].timestamp - buffer[0].timestamp
             if span > 0:
-                return (len(self._buffer) - 1) / span
+                return (len(buffer) - 1) / span
         return max(1.0, fallback)
 
     def start_event(self, frame: VideoFrame, inventory: list[str]) -> None:
@@ -443,20 +510,55 @@ class ClipRecorder:
 
             started_at = frame.timestamp
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            clip_path = self.output_dir / f"{frame.source_id}_{stamp}.mp4"
-            metadata_path = clip_path.with_suffix(".json")
-            fps = self._estimate_buffer_fps(fallback=frame.fps or 12.0)
-            sink = self.sink_factory(clip_path, (frame.width, frame.height), fps)
+            base_path = self.output_dir / f"{frame.source_id}_{stamp}.mp4"
+            metadata_path = base_path.with_suffix(".json")
+            snapshot_path = base_path.with_suffix(".jpg")
+            size = (frame.width, frame.height)
+            snapshot_written = _write_snapshot_jpeg(snapshot_path, frame.image)
+
+            raw_sink: ClipSink | None = None
+            raw_path: Path | None = None
+            overlay_sink: ClipSink | None = None
+            overlay_path: Path | None = None
+
+            if self._raw_enabled:
+                raw_path = base_path
+                raw_fps = self._estimate_buffer_fps(
+                    self._raw_buffer, fallback=frame.fps or 12.0
+                )
+                raw_sink = self.sink_factory(raw_path, size, raw_fps)
+                for buffered in self._raw_buffer:
+                    raw_sink.write(buffered.image)
+
+            if self._overlay_enabled:
+                overlay_path = (
+                    base_path
+                    if self.mode == "overlay"
+                    else base_path.with_suffix(".overlay.mp4")
+                )
+                overlay_fps = self._estimate_buffer_fps(
+                    self._overlay_buffer, fallback=frame.fps or 12.0
+                )
+                overlay_sink = self.sink_factory(overlay_path, size, overlay_fps)
+                for buffered in self._overlay_buffer:
+                    overlay_sink.write(buffered.image)
+
+            # Canonical clip_path: raw when produced, otherwise overlay.
+            canonical_path = raw_path if raw_path is not None else overlay_path
+            assert canonical_path is not None  # mode guarantees at least one channel
+
             self._event = _OpenEvent(
-                clip_path=clip_path,
+                clip_path=canonical_path,
                 metadata_path=metadata_path,
                 started_at=started_at,
                 inventory=list(inventory),
                 source_id=frame.source_id,
-                sink=sink,
+                raw_sink=raw_sink,
+                raw_path=raw_path,
+                overlay_sink=overlay_sink,
+                overlay_path=overlay_path,
+                snapshot_path=snapshot_path if snapshot_written else None,
             )
-            for buffered in self._buffer:
-                sink.write(buffered.image)
 
     def finish_event(self, timestamp: float, person_ids: list[str]) -> None:
         with self._lock:
@@ -481,18 +583,39 @@ class ClipRecorder:
         self._completed.clear()
         return completed
 
-    def _close_event(self, ended_at: float) -> EventArtifact | None:
-        if self._event is None:
-            return None
+    def _maybe_close_channel(self, channel: str, timestamp: float) -> None:
         event = self._event
-        event.sink.close()
+        if event is None or event.end_requested_at is None:
+            return
+        if timestamp < event.end_requested_at:
+            return
+        if channel == "raw" and event.raw_sink is not None:
+            event.raw_sink.close()
+            event.raw_sink = None
+        elif channel == "overlay" and event.overlay_sink is not None:
+            event.overlay_sink.close()
+            event.overlay_sink = None
+
+    def _maybe_finalize(self, ended_at: float) -> EventArtifact | None:
+        event = self._event
+        if event is None or event.end_requested_at is None:
+            return None
+        if event.raw_sink is not None or event.overlay_sink is not None:
+            return None
         payload = {
             "clip_path": str(event.clip_path),
+            "snapshot_path": (
+                str(event.snapshot_path) if event.snapshot_path is not None else None
+            ),
             "source_id": event.source_id,
             "inventory": event.inventory,
             "started_at": event.started_at,
             "ended_at": ended_at,
             "person_ids": sorted(event.person_ids),
+            "raw_clip_path": str(event.raw_path) if event.raw_path is not None else None,
+            "overlay_clip_path": (
+                str(event.overlay_path) if event.overlay_path is not None else None
+            ),
         }
         with event.metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
@@ -502,7 +625,36 @@ class ClipRecorder:
             started_at=event.started_at,
             ended_at=ended_at,
             person_ids=sorted(event.person_ids),
+            snapshot_path=event.snapshot_path,
+            overlay_clip_path=(
+                event.overlay_path if self.mode == "both" else None
+            ),
         )
         self._completed.append(artifact)
         self._event = None
         return artifact
+
+
+def _write_snapshot_jpeg(path: Path, image: np.ndarray) -> bool:
+    """Encode `image` to `path` atomically. Returns True on success."""
+    try:
+        from .jpeg import encode_jpeg
+    except Exception:
+        return False
+    try:
+        data = encode_jpeg(image)
+    except Exception:
+        return False
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("wb") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True

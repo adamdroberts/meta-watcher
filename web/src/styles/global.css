@@ -219,3 +219,219 @@ button:disabled {
   background: #c9a227;
   color: #2a1e00;
 }
+
+/* -------------------------------------------------- Settings page */
+
+.panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-header h1 {
+  margin: 0;
+}
+
+.settings-nav {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.settings-nav:hover {
+  text-decoration: underline;
+}
+
+.settings-layout {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.settings-header h1 {
+  margin: 0;
+}
+
+.settings-panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.file-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.file-bar-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.6px;
+}
+
+.file-bar select {
+  background: #0e1115;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  min-width: 260px;
+}
+
+.active-path {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.fieldset {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px 16px 16px;
+  background: #0e1115;
+}
+
+.fieldset legend,
+.details-fieldset > summary {
+  color: var(--accent);
+  font-size: 13px;
+  letter-spacing: 0.4px;
+  padding: 0 6px;
+  cursor: default;
+}
+
+.details-fieldset > summary {
+  cursor: pointer;
+  list-style: none;
+  padding-bottom: 8px;
+}
+
+.details-fieldset > summary::before {
+  content: "▶ ";
+  font-size: 10px;
+}
+
+.details-fieldset[open] > summary::before {
+  content: "▼ ";
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.form-grid label.full {
+  grid-column: 1 / -1;
+}
+
+.form-grid label.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.form-grid input,
+.form-grid select {
+  background: #0b0d10;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.form-grid input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.form-grid .hint {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.restart-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  background: rgba(201, 162, 39, 0.2);
+  color: #e9c874;
+  margin-left: 4px;
+  text-transform: uppercase;
+}
+
+.banner.warn {
+  background: rgba(201, 162, 39, 0.18);
+  color: #e9c874;
+  border: 1px solid rgba(201, 162, 39, 0.4);
+  display: block;
+}
+
+.banner[hidden] {
+  display: none;
+}
+
+.settings-buttons {
+  display: flex;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.toast {
+  display: none;
+  background: #0e1115;
+  color: var(--ok);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.toast.visible {
+  display: block;
+}

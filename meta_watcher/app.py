@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 from .config import load_config
 from .web import RuntimeState, build_app
@@ -22,15 +23,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Open the web UI in a browser on startup (off by default).",
     )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help=argparse.SUPPRESS,  # kept for backward compatibility; default is already no-browser.
-    )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    state = RuntimeState(config)
+    active_path = Path(args.config).resolve() if args.config else None
+    state = RuntimeState(config, active_config_path=active_path)
     app = build_app(state)
 
     try:
@@ -43,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
     url = f"http://{args.host}:{args.port}"
     print(f"[meta-watcher] web UI: {url}", file=sys.stderr, flush=True)
-    if args.open_browser and not args.no_browser:
+    if args.open_browser:
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
 
     try:
