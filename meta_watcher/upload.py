@@ -1,17 +1,33 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import os
 import queue
 import sys
 import threading
-from typing import Any
+from typing import Any, Iterator
 
 from .config import TimestampConfig, UploadConfig
 from .core import EventArtifact
 from .timestamp import TimestampError, stamp_file
+
+
+@dataclass(slots=True, frozen=True)
+class ObjectInfo:
+    """Metadata about a single object in the configured bucket.
+
+    `time_modified` is tz-aware UTC. `size` is bytes. `md5`/`etag` are
+    provider-reported (empty on providers that don't populate them)."""
+
+    key: str
+    size: int
+    time_modified: datetime | None
+    md5: str = ""
+    etag: str = ""
 
 
 class UploadProvider(ABC):
@@ -26,6 +42,27 @@ class UploadProvider(ABC):
 
         Returns a human-readable URL/key on success, raises on failure.
         """
+
+    # --- read-side (dashboard browser) -----------------------------------
+    def list_objects(
+        self, prefix: str = "", *, start: str | None = None, limit: int = 1000
+    ) -> list[ObjectInfo]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not yet support listing objects; "
+            "only the 'oci' provider is supported by the analytics dashboard."
+        )
+
+    def fetch_object(
+        self, key: str, *, byte_range: tuple[int, int] | None = None
+    ) -> tuple[Iterator[bytes], int, str]:
+        """Return ``(chunk_iterator, total_bytes, content_type)``.
+
+        When ``byte_range=(start, end)`` is given, only that byte range
+        (inclusive) is streamed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not yet support fetching objects."
+        )
 
 
 class GcpUploadProvider(UploadProvider):
@@ -114,6 +151,76 @@ class OciUploadProvider(UploadProvider):
             )
         return f"oci://{self._namespace}/{self._bucket_name}/{remote_key}"
 
+    def list_objects(
+        self, prefix: str = "", *, start: str | None = None, limit: int = 1000
+    ) -> list[ObjectInfo]:
+        collected: list[ObjectInfo] = []
+        cursor = start
+        fields = "name,size,timeModified,md5,etag"
+        while len(collected) < limit:
+            page_size = min(limit - len(collected), 1000)
+            resp = self._client.list_objects(
+                self._namespace,
+                self._bucket_name,
+                prefix=prefix or None,
+                start=cursor,
+                limit=page_size,
+                fields=fields,
+            )
+            data = resp.data
+            for obj in getattr(data, "objects", []) or []:
+                collected.append(
+                    ObjectInfo(
+                        key=obj.name,
+                        size=int(getattr(obj, "size", 0) or 0),
+                        time_modified=getattr(obj, "time_modified", None),
+                        md5=getattr(obj, "md5", "") or "",
+                        etag=getattr(obj, "etag", "") or "",
+                    )
+                )
+            cursor = getattr(data, "next_start_with", None)
+            if not cursor:
+                break
+        return collected
+
+    def fetch_object(
+        self, key: str, *, byte_range: tuple[int, int] | None = None
+    ) -> tuple[Iterator[bytes], int, str]:
+        range_header: str | None = None
+        if byte_range is not None:
+            start, end = byte_range
+            range_header = f"bytes={start}-{end}"
+        resp = self._client.get_object(
+            self._namespace,
+            self._bucket_name,
+            key,
+            range=range_header,
+        )
+        headers = getattr(resp, "headers", {}) or {}
+        content_length = int(
+            headers.get("Content-Length") or headers.get("content-length") or 0
+        )
+        content_type = (
+            headers.get("Content-Type")
+            or headers.get("content-type")
+            or "application/octet-stream"
+        )
+        stream = resp.data
+
+        def _iter() -> Iterator[bytes]:
+            # Real OCI SDK exposes `.raw` (urllib3) with `.stream()`; the fake
+            # uses `.iter_content()`. Support both shapes.
+            if hasattr(stream, "iter_content"):
+                yield from stream.iter_content(chunk_size=65536)
+            elif hasattr(stream, "raw"):
+                yield from stream.raw.stream(amt=65536, decode_content=False)
+            else:  # pragma: no cover
+                data = stream.read() if hasattr(stream, "read") else bytes(stream)
+                if data:
+                    yield data
+
+        return _iter(), content_length, content_type
+
 
 def build_upload_provider(config: UploadConfig) -> UploadProvider | None:
     if not config.enabled or not config.bucket:
@@ -149,16 +256,22 @@ class _UploadJob:
 class EventUploader:
     """Background uploader that accepts EventArtifacts and ships them off-device.
 
-    One worker thread, bounded drop-oldest queue (same policy as
-    `StreamRuntime._put_latest`). Upload failures are logged to stderr and
-    silently dropped — there is no retry loop.
+    A small `ThreadPoolExecutor` (size = `UploadConfig.upload_workers`) runs
+    uploads in parallel; a single feeder thread drains a bounded drop-oldest
+    queue into the pool. Upload failures are logged to stderr and silently
+    dropped — there is no retry loop.
 
-    When a TimestampConfig is provided and `timestamps.enabled` is true, the
-    uploader will run `ots stamp` on each uploaded artifact that was tagged
-    with `timestamp=True` at enqueue time, then upload the resulting `.ots`
-    sidecar to `{remote_key}.ots`. Timestamp failures are non-fatal: the
-    primary upload is already complete, and the parent file is still deleted
-    if `delete_after_upload` was set (so the sidecar is best-effort).
+    When a TimestampConfig is provided and `timestamps.enabled` is true, each
+    worker runs `ots stamp` on its own uploaded artifact (when tagged with
+    `timestamp=True` at enqueue time), then uploads the resulting `.ots`
+    sidecar. Keeping stamp+sidecar inside the same worker means a slow
+    `ots stamp` only consumes 1/N of the pool, not the whole queue. Timestamp
+    failures are non-fatal: the primary upload is already complete, and the
+    parent file is still deleted if `delete_after_upload` was set.
+
+    The bounded input queue is the real backpressure; a semaphore caps
+    in-flight submissions so the pool's internal queue can't balloon past
+    `2 × upload_workers`, keeping drop-oldest observable under load.
     """
 
     def __init__(
@@ -172,26 +285,38 @@ class EventUploader:
         self._timestamps = timestamps if timestamps is not None else TimestampConfig()
         self._queue: queue.Queue[_UploadJob] = queue.Queue(maxsize=max(1, config.queue_size))
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._max_workers = max(1, getattr(config, "upload_workers", 4))
+        self._slots = threading.BoundedSemaphore(self._max_workers * 2)
+        self._feeder: threading.Thread | None = None
+        self._pool: ThreadPoolExecutor | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._feeder is not None:
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="meta-watcher-uploader",
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix="mw-upload",
+        )
+        self._feeder = threading.Thread(
+            target=self._run_feeder,
+            name="meta-watcher-uploader-feeder",
             daemon=True,
         )
-        self._thread.start()
+        self._feeder.start()
 
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop.set()
-        thread = self._thread
-        if thread is None:
-            return
-        thread.join(timeout=timeout)
-        self._thread = None
+        feeder = self._feeder
+        if feeder is not None:
+            feeder.join(timeout=timeout)
+        self._feeder = None
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            # wait=True lets in-flight uploads finish cleanly; cancel_futures
+            # drops anything queued-but-not-started so shutdown returns promptly.
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def enqueue_artifact(self, artifact: EventArtifact, *, skip_snapshot: bool = False) -> None:
         event_id = artifact.clip_path.stem
@@ -323,46 +448,73 @@ class EventUploader:
         )
         return sidecar
 
-    def _run(self) -> None:
+    def _run_feeder(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
             try:
                 job = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # Block until a worker slot is free so the pool's internal queue
+            # stays shallow and drop-oldest stays meaningful on the input queue.
+            acquired = False
+            while not self._stop.is_set():
+                if self._slots.acquire(timeout=0.2):
+                    acquired = True
+                    break
+            if not acquired:
+                return
+            pool = self._pool
+            if pool is None:
+                self._slots.release()
+                return
             try:
-                remote = self._provider.upload(job.local_path, job.remote_key)
-                print(
-                    f"[meta-watcher] upload ok: {remote}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                delete_after = (
-                    job.delete_after_upload
-                    if job.delete_after_upload is not None
-                    else self._config.delete_after_upload
-                )
-                sidecar_path = self._maybe_stamp_and_upload(job)
-                if delete_after:
+                pool.submit(self._process_job_slot, job)
+            except RuntimeError:
+                # Pool was shut down while we were submitting; exit cleanly.
+                self._slots.release()
+                return
+
+    def _process_job_slot(self, job: _UploadJob) -> None:
+        try:
+            self._process_job(job)
+        finally:
+            self._slots.release()
+
+    def _process_job(self, job: _UploadJob) -> None:
+        try:
+            remote = self._provider.upload(job.local_path, job.remote_key)
+            print(
+                f"[meta-watcher] upload ok: {remote}",
+                file=sys.stderr,
+                flush=True,
+            )
+            delete_after = (
+                job.delete_after_upload
+                if job.delete_after_upload is not None
+                else self._config.delete_after_upload
+            )
+            sidecar_path = self._maybe_stamp_and_upload(job)
+            if delete_after:
+                try:
+                    job.local_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(
+                        f"[meta-watcher] delete-after-upload failed for {job.local_path}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if sidecar_path is not None:
                     try:
-                        job.local_path.unlink(missing_ok=True)
+                        sidecar_path.unlink(missing_ok=True)
                     except OSError as exc:
                         print(
-                            f"[meta-watcher] delete-after-upload failed for {job.local_path}: {exc}",
+                            f"[meta-watcher] delete-after-upload failed for {sidecar_path}: {exc}",
                             file=sys.stderr,
                             flush=True,
                         )
-                    if sidecar_path is not None:
-                        try:
-                            sidecar_path.unlink(missing_ok=True)
-                        except OSError as exc:
-                            print(
-                                f"[meta-watcher] delete-after-upload failed for {sidecar_path}: {exc}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-            except Exception as exc:  # noqa: BLE001 — we want to swallow anything from SDKs.
-                print(
-                    f"[meta-watcher] upload failed for {job.local_path.name}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        except Exception as exc:  # noqa: BLE001 — we want to swallow anything from SDKs.
+            print(
+                f"[meta-watcher] upload failed for {job.local_path.name}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )

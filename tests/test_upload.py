@@ -232,6 +232,57 @@ class EventUploaderTests(unittest.TestCase):
             keys = [key for _, key in provider.calls]
         self.assertEqual(keys, ["meta/cam_001/cam_001.jpg"])
 
+    def test_uploads_run_in_parallel_across_workers(self) -> None:
+        # Four uploads must rendezvous simultaneously on a barrier; if the
+        # pool only has one worker (or upload is still serial), the barrier
+        # times out and this test fails loudly rather than hanging forever.
+        barrier = threading.Barrier(parties=4, timeout=3.0)
+
+        class BarrierProvider(FakeProvider):
+            def upload(self, local_path: Path, remote_key: str) -> str:
+                barrier.wait()
+                return super().upload(local_path, remote_key)
+
+        provider = BarrierProvider()
+        cfg = UploadConfig(
+            enabled=True,
+            provider="fake",
+            bucket="b",
+            prefix="meta/",
+            upload_videos=True,
+            upload_snapshots=False,
+            upload_metadata=False,
+            upload_workers=4,
+        )
+        uploader = EventUploader(provider, cfg)
+        uploader.start()
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                for index in range(4):
+                    clip = Path(tempdir) / f"cam_{index:03d}.mp4"
+                    clip.write_bytes(b"x")
+                    uploader.enqueue_artifact(
+                        EventArtifact(
+                            clip_path=clip,
+                            metadata_path=clip.with_suffix(".json"),
+                            started_at=0.0,
+                            ended_at=1.0,
+                            person_ids=[],
+                            snapshot_path=None,
+                        )
+                    )
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
+                    with provider.lock:
+                        if len(provider.calls) >= 4:
+                            break
+                    time.sleep(0.02)
+        finally:
+            uploader.stop(timeout=3.0)
+
+        with provider.lock:
+            self.assertEqual(len(provider.calls), 4)
+
     def test_queue_overflow_drops_oldest_without_raising(self) -> None:
         # Provider blocks until released so we can queue more jobs than capacity.
         release = threading.Event()
@@ -423,6 +474,10 @@ class _FakeOciModule:
         self.config_to_return: dict[str, object] = {"region": "us-ashburn-1"}
         self.namespace_value = "tenancy-ns"
         self.put_calls: list[tuple[str, str, str]] = []
+        self.objects: dict[str, bytes] = {}
+        self.object_meta: dict[str, dict] = {}
+        self.list_calls: list[dict] = []
+        self.get_calls: list[dict] = []
 
         parent = self
 
@@ -451,6 +506,100 @@ class _FakeOciModule:
                 _body: object,
             ) -> None:
                 parent.put_calls.append((namespace, bucket, name))
+
+            def list_objects(
+                self,
+                namespace: str,
+                bucket: str,
+                *,
+                prefix: str | None = None,
+                start: str | None = None,
+                limit: int | None = None,
+                fields: str | None = None,
+            ) -> object:
+                parent.list_calls.append(
+                    {
+                        "namespace": namespace,
+                        "bucket": bucket,
+                        "prefix": prefix,
+                        "start": start,
+                        "limit": limit,
+                        "fields": fields,
+                    }
+                )
+                keys = sorted(parent.objects.keys())
+                if prefix:
+                    keys = [k for k in keys if k.startswith(prefix)]
+                if start:
+                    keys = [k for k in keys if k > start]
+                next_start: str | None = None
+                if limit and len(keys) > limit:
+                    next_start = keys[limit - 1]
+                    keys = keys[:limit]
+
+                class _Obj:
+                    def __init__(self, name: str, meta: dict) -> None:
+                        self.name = name
+                        self.size = meta.get("size", 0)
+                        self.time_modified = meta.get("time_modified")
+                        self.md5 = meta.get("md5")
+                        self.etag = meta.get("etag")
+
+                objs = [_Obj(n, parent.object_meta.get(n, {})) for n in keys]
+                return types.SimpleNamespace(
+                    data=types.SimpleNamespace(
+                        objects=objs,
+                        next_start_with=next_start,
+                    )
+                )
+
+            def get_object(
+                self,
+                namespace: str,
+                bucket: str,
+                name: str,
+                **kwargs: object,
+            ) -> object:
+                # The real OCI SDK exposes a keyword-only `range` parameter; we
+                # accept it via **kwargs here to avoid shadowing the builtin
+                # inside this closure.
+                range_header = kwargs.get("range")
+                parent.get_calls.append(
+                    {
+                        "namespace": namespace,
+                        "bucket": bucket,
+                        "name": name,
+                        "range": range_header,
+                    }
+                )
+                if name not in parent.objects:
+                    raise RuntimeError(f"404 not found: {name}")
+                body = parent.objects[name]
+                if range_header:
+                    import re as _re
+
+                    m = _re.match(r"bytes=(\d+)-(\d*)$", str(range_header))
+                    if m:
+                        s = int(m.group(1))
+                        e = int(m.group(2)) if m.group(2) else len(body) - 1
+                        body = body[s : e + 1]
+
+                class _Stream:
+                    def __init__(self, b: bytes) -> None:
+                        self._b = b
+
+                    def iter_content(self, chunk_size: int = 8192):
+                        for i in range(0, len(self._b), chunk_size):
+                            yield self._b[i : i + chunk_size]
+
+                return types.SimpleNamespace(
+                    data=_Stream(body),
+                    headers={
+                        "Content-Length": str(len(body)),
+                        "Content-Type": "application/octet-stream",
+                    },
+                    status=206 if range_header else 200,
+                )
 
         self.config = _Config
         self.object_storage = types.SimpleNamespace(
@@ -989,6 +1138,60 @@ class OciUploadProviderTests(unittest.TestCase):
         assert provider is not None
         self.assertEqual(provider._client.config["region"], "uk-london-1")  # type: ignore[attr-defined]
         self.assertEqual(provider._namespace, "ns-from-config")  # type: ignore[attr-defined]
+
+
+class OciReadProviderTests(unittest.TestCase):
+    def _install_fake(self) -> _FakeOciModule:
+        fake = _FakeOciModule()
+        self.addCleanup(lambda: sys.modules.pop("oci", None))
+        sys.modules["oci"] = fake  # type: ignore[assignment]
+        return fake
+
+    def test_list_objects_forwards_prefix_and_returns_object_infos(self) -> None:
+        from datetime import datetime, timezone
+
+        fake = self._install_fake()
+        fake.objects["meta-watcher/evt_a/evt_a.mp4"] = b"v"
+        fake.objects["meta-watcher/evt_a/evt_a.jpg"] = b"j"
+        fake.objects["other/unrelated.txt"] = b"u"
+        fake.object_meta["meta-watcher/evt_a/evt_a.mp4"] = {
+            "size": 1,
+            "time_modified": datetime(2026, 4, 19, 12, tzinfo=timezone.utc),
+            "md5": "abc",
+            "etag": "e1",
+        }
+        provider = OciUploadProvider("bkt", namespace="ns")
+        infos = provider.list_objects(prefix="meta-watcher/")
+        self.assertEqual(
+            [o.key for o in infos],
+            ["meta-watcher/evt_a/evt_a.jpg", "meta-watcher/evt_a/evt_a.mp4"],
+        )
+        self.assertEqual(fake.list_calls[0]["prefix"], "meta-watcher/")
+        mp4 = next(o for o in infos if o.key.endswith(".mp4"))
+        self.assertEqual(mp4.size, 1)
+        self.assertEqual(mp4.md5, "abc")
+
+    def test_fetch_object_streams_full_body(self) -> None:
+        fake = self._install_fake()
+        fake.objects["meta-watcher/evt/clip.mp4"] = b"0123456789" * 200
+        provider = OciUploadProvider("bkt", namespace="ns")
+        chunks, total, _ctype = provider.fetch_object("meta-watcher/evt/clip.mp4")
+        body = b"".join(chunks)
+        self.assertEqual(total, 2000)
+        self.assertEqual(body, b"0123456789" * 200)
+        self.assertIsNone(fake.get_calls[0]["range"])
+
+    def test_fetch_object_applies_byte_range(self) -> None:
+        fake = self._install_fake()
+        fake.objects["meta-watcher/evt/clip.mp4"] = b"0123456789" * 200
+        provider = OciUploadProvider("bkt", namespace="ns")
+        chunks, total, _ = provider.fetch_object(
+            "meta-watcher/evt/clip.mp4", byte_range=(10, 19)
+        )
+        body = b"".join(chunks)
+        self.assertEqual(body, b"0123456789")
+        self.assertEqual(fake.get_calls[0]["range"], "bytes=10-19")
+        self.assertEqual(total, 10)
 
 
 if __name__ == "__main__":
