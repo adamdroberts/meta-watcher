@@ -152,6 +152,95 @@ def build_app(state: RuntimeState) -> FastAPI:
         state.set_recording_enabled(enabled)
         return JSONResponse({"recording_enabled": enabled})
 
+    @app.get("/api/storage/health")
+    def storage_health() -> JSONResponse:
+        return JSONResponse(state.storage_health())
+
+    @app.get("/api/recordings")
+    def list_recordings() -> JSONResponse:
+        return JSONResponse(state.list_recordings())
+
+    @app.get("/api/recordings/{event_id}")
+    def recording_detail(event_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(state.recording_detail(event_id))
+        except KeyError:
+            return JSONResponse(
+                {"error": f"event not found: {event_id}"}, status_code=404
+            )
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+
+    @app.get("/api/recordings/{event_id}/artifact")
+    def get_artifact(event_id: str, key: str, request: Request) -> Response:
+        event_segment = f"/{event_id}/"
+        if event_segment not in key and not key.endswith(f"/{event_id}"):
+            return JSONResponse(
+                {"error": "key does not belong to event"}, status_code=400
+            )
+
+        byte_range: tuple[int, int] | None = None
+        total_hint: int | None = None
+        range_header = request.headers.get("range") or request.headers.get("Range")
+        if range_header:
+            import re
+
+            m = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
+            if not m:
+                return Response(status_code=416)
+            start = int(m.group(1))
+            end: int | None = int(m.group(2)) if m.group(2) else None
+
+            try:
+                detail = state.recording_detail(event_id)
+            except KeyError:
+                return JSONResponse({"error": "event not found"}, status_code=404)
+            total_hint = next(
+                (a["size"] for a in detail["artifacts"] if a["key"] == key), None
+            )
+            if total_hint is None:
+                return JSONResponse({"error": "artifact not found"}, status_code=404)
+            if end is None or end >= total_hint:
+                end = total_hint - 1
+            byte_range = (start, end)
+
+        try:
+            chunks, length, content_type = state.stream_artifact(
+                key, byte_range=byte_range
+            )
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+
+        headers: dict[str, str] = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+        }
+        status_code = 200
+        if byte_range is not None and total_hint is not None:
+            start, end = byte_range
+            headers["Content-Range"] = f"bytes {start}-{end}/{total_hint}"
+            status_code = 206
+
+        return StreamingResponse(
+            chunks,
+            media_type=content_type,
+            headers=headers,
+            status_code=status_code,
+        )
+
+    @app.post("/api/recordings/{event_id}/verify")
+    def verify_recording(event_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(state.verify_recording(event_id))
+        except KeyError:
+            return JSONResponse(
+                {"error": f"event not found: {event_id}"}, status_code=404
+            )
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+
     @app.get("/stream.mjpg")
     def stream_mjpg() -> StreamingResponse:
         return StreamingResponse(
