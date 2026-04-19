@@ -16,6 +16,36 @@ from .core import EventArtifact
 from .timestamp import TimestampError, stamp_file
 
 
+_CONTENT_TYPE_BY_EXT: dict[str, str] = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".ots": "application/vnd.opentimestamps.ots",
+}
+
+
+def _infer_content_type(key: str, *, fallback: str = "application/octet-stream") -> str:
+    """Map a storage key's extension to a sensible browser-friendly MIME.
+
+    OCI stores uploaded objects with whatever Content-Type the upload call
+    advertised; Meta Watcher uploads as octet-stream, so when the dashboard
+    streams them back, the browser has no hint for ``<video>`` / ``<img>``.
+    This lets callers override by filename extension when the stored type
+    is generic.
+    """
+    lowered = key.lower()
+    dot = lowered.rfind(".")
+    if dot == -1:
+        return fallback
+    return _CONTENT_TYPE_BY_EXT.get(lowered[dot:], fallback)
+
+
 @dataclass(slots=True, frozen=True)
 class ObjectInfo:
     """Metadata about a single object in the configured bucket.
@@ -200,11 +230,18 @@ class OciUploadProvider(UploadProvider):
         content_length = int(
             headers.get("Content-Length") or headers.get("content-length") or 0
         )
-        content_type = (
+        reported_type = (
             headers.get("Content-Type")
             or headers.get("content-type")
             or "application/octet-stream"
         )
+        # Meta Watcher uploads files without an explicit Content-Type, so OCI
+        # stores them as application/octet-stream. That's a problem for the
+        # dashboard — browsers need the real MIME to render <video>/<img>. If
+        # OCI gave us a generic type, infer from the key's extension.
+        content_type = reported_type
+        if reported_type in ("application/octet-stream", "binary/octet-stream"):
+            content_type = _infer_content_type(key, fallback=reported_type)
         stream = resp.data
 
         def _iter() -> Iterator[bytes]:
