@@ -71,6 +71,7 @@ class UploadConfig:
     upload_metadata: bool = True
     delete_after_upload: bool = False
     queue_size: int = 32
+    upload_workers: int = 4
 
 
 @dataclass(slots=True)

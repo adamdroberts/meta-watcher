@@ -1,0 +1,33 @@
+---
+import "../styles/global.css";
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Meta Watcher — Analytics</title>
+  </head>
+  <body>
+    <main class="dashboard-layout">
+      <header class="dashboard-header">
+        <a class="settings-nav" href="/">&larr; Back to live</a>
+        <a class="settings-nav" href="/settings">Settings →</a>
+        <h1>Analytics</h1>
+        <span id="dashboard-storage-badge" class="mode-pill" data-state="unknown">storage: …</span>
+        <button id="dashboard-refresh" class="primary" type="button">Refresh</button>
+      </header>
+
+      <div id="dashboard-banner" class="banner" role="status"></div>
+
+      <section class="dashboard-main">
+        <div id="recording-grid" class="recording-grid" aria-live="polite"></div>
+        <aside id="recording-detail" class="recording-detail" hidden>
+          <button id="recording-detail-close" class="detail-close" type="button" aria-label="Close">✕</button>
+          <div id="recording-detail-body"></div>
+        </aside>
+      </section>
+    </main>
+    <script src="../scripts/dashboard.ts"></script>
+  </body>
+</html>
