@@ -317,6 +317,12 @@ class TransformersObjectDetectionProvider(InferenceProvider):
         model = model.to(device)
         model.train(False)
 
+        print(
+            f"[meta-watcher] inference provider={self.model_id} device={device.type}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         self._processor = processor
         self._model = model
         self._device = device
@@ -333,8 +339,13 @@ class TransformersObjectDetectionProvider(InferenceProvider):
         if hasattr(inputs, "to"):
             inputs = inputs.to(self._device)
 
+        device_type = self._device.type if self._device is not None else "cpu"
         with torch.inference_mode():
-            outputs = self._model(**inputs)
+            if device_type == "cuda" and hasattr(torch, "autocast"):
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = self._model(**inputs)
+            else:
+                outputs = self._model(**inputs)
 
         target_sizes = [(frame.height, frame.width)]
         results = self._processor.post_process_object_detection(
