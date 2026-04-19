@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 from PIL import Image
@@ -29,7 +29,9 @@ from ..core import ClipRecorder, PipelineSnapshot
 from ..inference import InferenceProvider, build_provider
 from ..pipeline import StreamProcessor, StreamRuntime
 from ..sources import VideoSource, build_source
+from ..storage_browser import StorageBrowser
 from ..upload import EventUploader, UploadProvider, build_upload_provider
+from ..verify import verify_file
 
 
 LIVE_FRAME_INTERVAL_SECONDS = 0.5
@@ -116,6 +118,9 @@ class RuntimeState:
         self._uploaded_snapshot_event_ids: set[str] = set()
         self._live_frame_last_mono: float = 0.0
         self._live_frame_event_id: str | None = None
+        self._storage_provider_override: UploadProvider | None = None  # test hook
+        self._storage_browser: StorageBrowser | None = None
+        self._storage_browser_signature: tuple | None = None
 
     # ------------------------------------------------------------------ config
 
@@ -133,6 +138,8 @@ class RuntimeState:
             except (TypeError, ValueError) as exc:
                 raise ConfigValidationError(str(exc)) from exc
             self._config = updated
+            self._storage_browser = None
+            self._storage_browser_signature = None
             return updated
 
     def active_config_path(self) -> Path | None:
@@ -193,6 +200,8 @@ class RuntimeState:
         with self._lock:
             self._config = loaded
             self._active_config_path = resolved
+            self._storage_browser = None
+            self._storage_browser_signature = None
         return loaded
 
     def save_active_config(self, path: str | Path | None = None) -> Path:
@@ -494,6 +503,210 @@ class RuntimeState:
             ],
             "completed_clips": completed,
             "error": error,
+        }
+
+    # ----------------------------------------------------------- recordings
+
+    def _storage_provider(self) -> UploadProvider | None:
+        with self._lock:
+            override = self._storage_provider_override
+            active_uploader = self._uploader
+            config = self._config
+        if override is not None:
+            return override
+        if active_uploader is not None:
+            return active_uploader._provider  # live authenticated client
+        try:
+            return build_upload_provider(config.upload)
+        except Exception as exc:  # noqa: BLE001 — SDK errors are opaque
+            print(
+                f"[meta-watcher] storage provider init failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+    def _browser(self) -> StorageBrowser | None:
+        provider = self._storage_provider()
+        if provider is None:
+            return None
+        with self._lock:
+            config = self._config
+            sig = (
+                config.upload.provider,
+                config.upload.bucket,
+                config.upload.prefix,
+                config.upload.namespace,
+            )
+            if self._storage_browser_signature != sig:
+                self._storage_browser = StorageBrowser(
+                    provider, prefix=config.upload.prefix
+                )
+                self._storage_browser_signature = sig
+            return self._storage_browser
+
+    def list_recordings(self) -> dict[str, Any]:
+        cfg = self.config().upload
+        if not cfg.enabled or not cfg.bucket:
+            return {"enabled": False, "provider": cfg.provider, "events": []}
+        browser = self._browser()
+        if browser is None:
+            return {
+                "enabled": True,
+                "provider": cfg.provider,
+                "events": [],
+                "error": "storage provider unavailable",
+            }
+        events = browser.list_events()
+        out: list[dict[str, Any]] = []
+        for e in events:
+            out.append(
+                {
+                    "event_id": e.event_id,
+                    "clip_key": e.clip_key,
+                    "overlay_clip_key": e.overlay_clip_key,
+                    "snapshot_key": e.snapshot_key,
+                    "metadata_key": e.metadata_key,
+                    "frame_count": e.frame_count,
+                    "total_size": e.total_size,
+                    "earliest_modified": (
+                        e.earliest_modified.isoformat()
+                        if e.earliest_modified is not None
+                        else None
+                    ),
+                    "latest_modified": (
+                        e.latest_modified.isoformat()
+                        if e.latest_modified is not None
+                        else None
+                    ),
+                    "timestamped_keys": sorted(e._timestamped_keys),
+                }
+            )
+        return {
+            "enabled": True,
+            "provider": cfg.provider,
+            "bucket": cfg.bucket,
+            "prefix": cfg.prefix,
+            "events": out,
+        }
+
+    def recording_detail(self, event_id: str) -> dict[str, Any]:
+        browser = self._browser()
+        if browser is None:
+            raise RuntimeError("storage provider unavailable")
+        detail = browser.event_detail(event_id)
+        return {
+            "event_id": detail.event_id,
+            "metadata": detail.metadata,
+            "metadata_key": detail.metadata_key,
+            "artifacts": [
+                {
+                    "key": a.key,
+                    "kind": a.kind.value,
+                    "size": a.size,
+                    "time_modified": (
+                        a.time_modified.isoformat()
+                        if a.time_modified is not None
+                        else None
+                    ),
+                    "sidecar_key": a.sidecar_key,
+                }
+                for a in detail.artifacts
+            ],
+        }
+
+    def _ensure_key_within_prefix(self, key: str) -> None:
+        prefix = self.config().upload.prefix
+        if prefix and not key.startswith(prefix):
+            raise PermissionError(
+                f"Key {key!r} is outside the configured prefix {prefix!r}."
+            )
+
+    def stream_artifact(
+        self,
+        key: str,
+        *,
+        byte_range: tuple[int, int] | None = None,
+    ) -> tuple[Iterator[bytes], int, str]:
+        self._ensure_key_within_prefix(key)
+        browser = self._browser()
+        if browser is None:
+            raise RuntimeError("storage provider unavailable")
+        return browser.open_artifact(key, byte_range=byte_range)
+
+    def verify_recording(self, event_id: str) -> dict[str, Any]:
+        browser = self._browser()
+        if browser is None:
+            raise RuntimeError("storage provider unavailable")
+        detail = browser.event_detail(event_id)
+        ts_cfg = self.config().timestamps
+        ots_binary = ts_cfg.ots_binary or "ots"
+
+        results: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="mw-verify-") as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            for art in detail.artifacts:
+                if art.sidecar_key is None:
+                    results.append(
+                        {
+                            "key": art.key,
+                            "status": "none",
+                            "message": "no .ots sidecar",
+                        }
+                    )
+                    continue
+                local_file = tmpdir / Path(art.key).name
+                local_ots = tmpdir / (Path(art.key).name + ".ots")
+                for target, remote_key in (
+                    (local_file, art.key),
+                    (local_ots, art.sidecar_key),
+                ):
+                    chunks, _total, _ct = browser.open_artifact(remote_key)
+                    with target.open("wb") as fh:
+                        for chunk in chunks:
+                            fh.write(chunk)
+                vr = verify_file(local_file, local_ots, ots_binary=ots_binary)
+                results.append(
+                    {
+                        "key": art.key,
+                        "status": vr.status.value,
+                        "message": vr.message,
+                    }
+                )
+        return {"event_id": event_id, "results": results}
+
+    def storage_health(self) -> dict[str, Any]:
+        cfg = self.config().upload
+        provider = self._storage_provider()
+        if not cfg.enabled:
+            return {
+                "ok": False,
+                "provider": cfg.provider,
+                "enabled": False,
+                "reason": "upload disabled in config",
+            }
+        if provider is None:
+            return {
+                "ok": False,
+                "provider": cfg.provider,
+                "enabled": True,
+                "reason": "provider init failed",
+            }
+        try:
+            provider.list_objects(prefix=cfg.prefix, limit=1)
+        except Exception as exc:  # noqa: BLE001 — surface SDK error text
+            return {
+                "ok": False,
+                "provider": cfg.provider,
+                "enabled": True,
+                "reason": str(exc),
+            }
+        return {
+            "ok": True,
+            "provider": provider.scheme,
+            "enabled": True,
+            "bucket": cfg.bucket,
+            "prefix": cfg.prefix,
         }
 
     def latest_jpeg(self) -> bytes | None:
